@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual Environment
+venv/
+env/
+.venv/
+.env/
+
+# Environment Variables
+.env
+.env.local
+.env.*
+
+# Playwright & Scraping State
+discovery/auth_state/
+*.json
+
+# Logs
+logs/
+*.log
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# MacOS
+.DS_Store
