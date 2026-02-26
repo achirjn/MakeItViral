@@ -57,7 +57,7 @@ async def discover_keyword(
                     logger.info("metadata_incomplete: unable to build reel_data")
                     continue
 
-                shortcode = raw_reel.get("shortcode")
+                shortcode = raw_reel.get("code")
                 if not shortcode:
                     logger.info("metadata_incomplete: missing shortcode")
                     continue
@@ -77,13 +77,27 @@ async def discover_keyword(
 
         page.on("response", handle_response)
 
-        await page.goto("https://www.instagram.com/")
+        try:
+            await page.goto(
+                "https://www.instagram.com/",
+                wait_until="domcontentloaded",
+                timeout=15000,
+            )
+        except Exception as e:
+            logger.warning("Goto timed out, but proceeding anyway: %s", e)
+
         await human_delay(3.0, 1.0)
 
         # Keep implementation minimal: rely on user exploring/searching while interception runs.
         max_wait_cycles = 30
-        for _ in range(max_wait_cycles):
+        for i in range(max_wait_cycles):
             if success_count >= limit:
                 break
-            await human_delay(2.0, 0.8)
-
+            logger.info(
+                "Waiting cycle %d/%d... (Found %d/%d reels so far)",
+                i + 1,
+                max_wait_cycles,
+                success_count,
+                limit,
+            )
+            await human_delay(2.5, 1.0)

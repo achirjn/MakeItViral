@@ -31,16 +31,46 @@ def _is_reels_response(response: Response) -> bool:
 
 def _extract_reels_from_payload(payload: Dict[str, Any]) -> list[Dict[str, Any]]:
     reels: list[Dict[str, Any]] = []
+    seen: set[str] = set()
 
-    data = payload.get("data") or {}
-    clips = data.get("xdt_api__v1__clips__home__connection_v2") or {}
+    def _add_reel(media_obj: Dict[str, Any]) -> None:
+        code = media_obj.get("code") or media_obj.get("shortcode")
+        if code and code not in seen:
+            seen.add(code)
+            reels.append(media_obj)
 
-    edges = clips.get("edges") or []
-    for edge in edges:
-        node = edge.get("node") or {}
-        media = node.get("media")
-        if isinstance(media, dict):
-            reels.append(media)
+    def _walk(obj: Any) -> None:
+        if isinstance(obj, dict):
+            # 1. Base case: This dict *is* a media object (REST or raw)
+            if "code" in obj or "shortcode" in obj:
+                # But only if it actually looks like a media object and not a deeply nested config
+                if "user" in obj or "owner" in obj or "caption" in obj:
+                    _add_reel(obj)
+                    return
+
+            # 2. Base case: GraphQL edges
+            if "edges" in obj and isinstance(obj["edges"], list):
+                for edge in obj["edges"]:
+                    if isinstance(edge, dict):
+                        node = edge.get("node")
+                        if isinstance(node, dict):
+                            media = node.get("media")
+                            if isinstance(media, dict):
+                                _add_reel(media)
+                            else:
+                                _add_reel(node)
+                # Don't return here, there might be other edge arrays parallel to this
+
+            # Recursive step
+            for v in obj.values():
+                _walk(v)
+
+        elif isinstance(obj, list):
+            for i in obj:
+                _walk(i)
+
+    # Start walking from 'data' slightly deeper if it exists to save time, else from root
+    _walk(payload.get("data") or payload)
 
     return reels
 

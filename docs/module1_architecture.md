@@ -89,5 +89,5 @@ All successfully ingested Reels are inserted with `ingestion_status = "pending"`
 ## Discovery Strategy (Playwright)
 Discovery scripts (`trending.py`, `hashtag.py`, `keyword.py`, `creator.py`) are independent Playwright scripts.
 - They utilize a shared authenticated session state (`auth.py` / `storageState.json`).
-- They primarily rely on **Network Interception** (`page.on("response")`) to capture precise metrics directly from Instagram's GraphQL/API responses, falling back to DOM parsing only when necessary.
-- Extracted dictionaries are passed directly to `ingestion_service.py` for processing.
+- They primarily rely on **Network Interception** (`page.on("response")`) to capture precise metrics directly from Instagram's background APIs (`/api/v1/feed/reels_media/`, `/api/graphql`, `xdt_api__v1__clips__home__connection_v2`).
+- Extracted dictionaries are parsed and normalized (e.g., converting Unix integer timestamps to PostgreSQL `timezone.utc` objects) before being passed directly to `ingestion_service.py` for processing.

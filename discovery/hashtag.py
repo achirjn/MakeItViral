@@ -54,7 +54,7 @@ async def discover_hashtag(
                     logger.info("metadata_incomplete: unable to build reel_data")
                     continue
 
-                shortcode = raw_reel.get("shortcode")
+                shortcode = raw_reel.get("code")
                 if not shortcode:
                     logger.info("metadata_incomplete: missing shortcode")
                     continue
@@ -74,13 +74,31 @@ async def discover_hashtag(
 
         page.on("response", handle_response)
 
-        await page.goto(f"https://www.instagram.com/explore/tags/{tag}/")
-        await human_delay(2.0, 0.5)
+        try:
+            await page.goto(
+                f"https://www.instagram.com/explore/tags/{tag}/",
+                wait_until="domcontentloaded",
+                timeout=15000,
+            )
+        except Exception as e:
+            logger.warning("Goto timed out, but proceeding anyway: %s", e)
+
+        await human_delay(3.0, 1.0)
 
         max_scrolls = 20
-        for _ in range(max_scrolls):
+        for i in range(max_scrolls):
             if success_count >= limit:
                 break
-            await page.mouse.wheel(0, 1200)
-            await human_delay(2.0, 0.8)
-
+            logger.info(
+                "Scroll %d/%d... (Found %d/%d reels so far)",
+                i + 1,
+                max_scrolls,
+                success_count,
+                limit,
+            )
+            await page.mouse.wheel(0, 1500)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=3000)
+            except Exception:
+                pass
+            await human_delay(2.5, 1.0)
