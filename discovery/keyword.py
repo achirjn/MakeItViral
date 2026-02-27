@@ -33,71 +33,79 @@ async def discover_keyword(
 
     async with async_playwright() as p:
         context = await get_authenticated_context(p, account_id=account_id)
-        page = await context.new_page()
+        browser = context.browser
+        try:
+            page = await context.new_page()
 
-        async def handle_response(response: Response) -> None:
-            nonlocal success_count
+            async def handle_response(response: Response) -> None:
+                nonlocal success_count
 
-            if success_count >= limit:
-                return
-            if not _is_reels_response(response):
-                return
-
-            try:
-                payload: Dict[str, Any] = await response.json()
-            except Exception:  # noqa: BLE001
-                return
-
-            for raw_reel in _extract_reels_from_payload(payload):
                 if success_count >= limit:
-                    break
-
-                reel_data = _build_reel_data(raw_reel)
-                if reel_data is None:
-                    logger.info("metadata_incomplete: unable to build reel_data")
-                    continue
-
-                shortcode = raw_reel.get("code")
-                if not shortcode:
-                    logger.info("metadata_incomplete: missing shortcode")
-                    continue
-
-                if shortcode in seen_shortcodes:
-                    logger.info("dedupe_skip: shortcode=%s", shortcode)
-                    continue
-
-                reel_data["discovery_source"] = f"keyword:{term}"
+                    return
+                if not _is_reels_response(response):
+                    return
 
                 try:
-                    Ingestor(session).ingest(reel_data)
-                    seen_shortcodes.add(shortcode)
-                    success_count += 1
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("ingestion_failure: %s", exc)
+                    payload: Dict[str, Any] = await response.json()
+                except Exception:  # noqa: BLE001
+                    return
 
-        page.on("response", handle_response)
+                for raw_reel in _extract_reels_from_payload(payload):
+                    if success_count >= limit:
+                        break
 
-        try:
-            await page.goto(
-                "https://www.instagram.com/",
-                wait_until="domcontentloaded",
-                timeout=15000,
-            )
-        except Exception as e:
-            logger.warning("Goto timed out, but proceeding anyway: %s", e)
+                    reel_data = _build_reel_data(raw_reel)
+                    if reel_data is None:
+                        logger.info("metadata_incomplete: unable to build reel_data")
+                        continue
 
-        await human_delay(3.0, 1.0)
+                    shortcode = raw_reel.get("code") or raw_reel.get("shortcode")
+                    if not shortcode:
+                        logger.info("metadata_incomplete: missing shortcode")
+                        continue
 
-        # Keep implementation minimal: rely on user exploring/searching while interception runs.
-        max_wait_cycles = 30
-        for i in range(max_wait_cycles):
-            if success_count >= limit:
-                break
-            logger.info(
-                "Waiting cycle %d/%d... (Found %d/%d reels so far)",
-                i + 1,
-                max_wait_cycles,
-                success_count,
-                limit,
-            )
-            await human_delay(2.5, 1.0)
+                    if shortcode in seen_shortcodes:
+                        logger.info("dedupe_skip: shortcode=%s", shortcode)
+                        continue
+
+                    reel_data["discovery_source"] = f"keyword:{term}"
+
+                    try:
+                        Ingestor(session).ingest(reel_data)
+                        seen_shortcodes.add(shortcode)
+                        success_count += 1
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("ingestion_failure: %s", exc)
+
+            page.on("response", handle_response)
+
+            try:
+                await page.goto(
+                    "https://www.instagram.com/",
+                    wait_until="domcontentloaded",
+                    timeout=15000,
+                )
+            except Exception as e:
+                logger.warning("Goto timed out, but proceeding anyway: %s", e)
+
+            await human_delay(3.0, 1.0)
+
+            # Keep implementation minimal: rely on user exploring/searching while interception runs.
+            max_wait_cycles = 30
+            for i in range(max_wait_cycles):
+                if success_count >= limit:
+                    break
+                logger.info(
+                    "Waiting cycle %d/%d... (Found %d/%d reels so far)",
+                    i + 1,
+                    max_wait_cycles,
+                    success_count,
+                    limit,
+                )
+                await human_delay(2.5, 1.0)
+        finally:
+            try:
+                await context.close()
+            finally:
+                if browser is not None:
+                    await browser.close()

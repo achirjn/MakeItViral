@@ -1,0 +1,17 @@
+playwright
+sqlalchemy
+psycopg2-binary
+python-dotenv
+tqdm
+yt-dlp
+Pillow
+pytesseract
+sentence-transformers
+pgvector
+
+# optional tier-2 dependency
+# faster-whisper
+
+# system dependency (not pip installable)
+# ffmpeg and ffprobe must be installed at OS level
+
