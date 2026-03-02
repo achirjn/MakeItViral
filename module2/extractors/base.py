@@ -71,6 +71,28 @@ class BaseExtractor(ABC):
     def requires_gpu(self) -> bool:
         raise NotImplementedError
 
+    # ── Activation planner metadata (non-abstract, safe defaults) ──
+
+    @property
+    def produces(self) -> set[str]:
+        """Logical feature names this extractor produces."""
+        return set()
+
+    @property
+    def requires(self) -> set[str]:
+        """Logical feature names required before this extractor can run."""
+        return set()
+
+    @property
+    def optional_requires(self) -> set[str]:
+        """Logical features used if available, but not required."""
+        return set()
+
+    @property
+    def heavy(self) -> bool:
+        """True if extractor is expensive (ML model, external API, etc.)."""
+        return False
+
     @abstractmethod
     async def run(self, context: ExtractionContext) -> ExtractorResult:
         raise NotImplementedError

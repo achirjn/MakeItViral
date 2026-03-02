@@ -23,11 +23,11 @@ CREATE TABLE IF NOT EXISTS reels (
     has_engagement_metrics BOOLEAN NOT NULL DEFAULT FALSE,
     is_training_eligible BOOLEAN NOT NULL DEFAULT FALSE,
     metadata_completeness_score DOUBLE PRECISION NOT NULL DEFAULT 0.0,
-    ingestion_status VARCHAR(32) NOT NULL DEFAULT 'pending',
+    ingestion_status VARCHAR(32) NOT NULL DEFAULT 'PENDING',
     discovery_source VARCHAR(255),
     created_at TIMESTAMPTZ NOT NULL,
     CONSTRAINT ck_reels_ingestion_status_valid
-        CHECK (ingestion_status IN ('pending', 'ready_for_processing', 'failed'))
+        CHECK (ingestion_status IN ('PENDING', 'READY_FOR_PROCESSING', 'COMPLETED', 'FAILED'))
 );
 
 CREATE TABLE IF NOT EXISTS ingestion_logs (

@@ -24,7 +24,7 @@ class Ingestor:
     - Resolve (upsert) creator.
     - Insert or update Reel (behavior 1-B).
     - Create IngestionLog entries (success; partial failure logging when possible).
-    - Leave ingestion_status as 'pending' (behavior 2-C).
+    - Leave ingestion_status as 'PENDING' (behavior 2-C).
     """
 
     def __init__(self, session: Session) -> None:
@@ -92,7 +92,7 @@ class Ingestor:
                     creator_id=creator.id,
                     publish_time=reel_data.get("publish_time"),
                     has_engagement_metrics=self._has_engagement_metrics(reel_data),
-                    # ingestion_status stays default 'pending' in this module
+                    # ingestion_status stays default 'PENDING' in this module
                     is_training_eligible=False,
                     metadata_completeness_score=compute_metadata_score(reel_data),
                     discovery_source=reel_data.get("discovery_source"),

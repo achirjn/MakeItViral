@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from dataclasses import dataclass
 from typing import List, Optional
 
+from module2.config import USE_REMOTE_INFERENCE
 from module2.context import ExtractionContext
 from module2.extractors.base import BaseExtractor, ExtractorResult
 from module2.logging_config import get_logger
@@ -13,26 +13,18 @@ from module2.logging_config import get_logger
 logger = get_logger("extractor.transcript")
 
 
+
 @dataclass(frozen=True)
 class TranscriptConfig:
-    """
-    Phase 10: keep transcription backend optional.
-
-    If no backend is available in the environment, the extractor will be skipped.
-    """
-
     language: Optional[str] = None
-
-
-_MODEL_CACHE = None
 
 
 class TranscriptExtractor(BaseExtractor):
     """
-    PHASE 10: Optional fast transcription over context.audio_path (.wav).
+    Transcription extractor.
 
-    Returns:
-      - transcript: string
+    Remote mode only: reads transcript from cached Colab response.
+    No local model loading.
     """
 
     def __init__(self, config: TranscriptConfig | None = None) -> None:
@@ -44,11 +36,11 @@ class TranscriptExtractor(BaseExtractor):
 
     @property
     def dependencies(self) -> List[str]:
-        return ["audio"]
+        return ["remote_inference"]
 
     @property
     def output_keys(self) -> List[str]:
-        return ["transcript"]
+        return ["transcript", "transcript_confidence"]
 
     @property
     def is_critical(self) -> bool:
@@ -58,42 +50,39 @@ class TranscriptExtractor(BaseExtractor):
     def requires_gpu(self) -> bool:
         return False
 
+    @property
+    def produces(self) -> set[str]:
+        return {"transcript"}
+
+    @property
+    def requires(self) -> set[str]:
+        return {"video"}
+
+    @property
+    def heavy(self) -> bool:
+        return True
+
     async def run(self, context: ExtractionContext) -> ExtractorResult:
-        if not context.audio_path:
-            return ExtractorResult.skipped("missing_audio_path")
+        if not USE_REMOTE_INFERENCE:
+            return ExtractorResult.failed("remote_inference_disabled")
 
-        # Optional backend: faster-whisper (if installed). We do not add deps here.
-        try:
-            from faster_whisper import WhisperModel  # type: ignore
-        except Exception:  # noqa: BLE001
-            logger.warning(
-                "whisper_missing_backend",
-                extra={"reel_id": context.reel_id},
-            )
-            return ExtractorResult.skipped("transcription_backend_not_available")
+        if not context.transcript:
+            return ExtractorResult.failed("missing_transcript")
 
-        try:
-            global _MODEL_CACHE
-            if _MODEL_CACHE is None:
-                _MODEL_CACHE = WhisperModel("base", device="cpu", compute_type="int8")
+        confidence = getattr(context, "transcript_confidence", 0.0)
 
-            model = _MODEL_CACHE
-            logger.debug(
-                "whisper_invoked",
-                extra={"reel_id": context.reel_id},
-            )
-            segments, _info = await asyncio.to_thread(
-                model.transcribe,
-                context.audio_path,
-                language=self._config.language,
-            )
-            text_parts: List[str] = []
-            for seg in segments:
-                seg_text = getattr(seg, "text", None)
-                if isinstance(seg_text, str) and seg_text.strip():
-                    text_parts.append(seg_text.strip())
-            transcript = " ".join(text_parts).strip()
-            return ExtractorResult.success({"transcript": transcript})
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Transcription failed: %s", exc)
-            return ExtractorResult.failed(f"transcription_failed:{exc}")
+        logger.info(
+            "transcript_from_context len=%d confidence=%.3f version=%s",
+            len(context.transcript),
+            confidence,
+            context.inference_version,
+            extra={"reel_id": context.reel_id},
+        )
+
+        return ExtractorResult.success(
+            {
+                "transcript": context.transcript,
+                "transcript_confidence": confidence,
+            }
+        )
+

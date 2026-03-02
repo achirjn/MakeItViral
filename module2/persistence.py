@@ -242,6 +242,35 @@ def persist_from_context(
     ):
         proj_feats = projections_entry.get("features")
         if isinstance(proj_feats, dict):
+            # Build feature_coverage: logical feature → produced (bool)
+            feature_coverage: dict[str, Any] = {}
+            for ext_name, entry in (context.intermediate_outputs or {}).items():
+                if ext_name == "projections" or ext_name.startswith("_"):
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                status = entry.get("status")
+                # True only if extractor ran and succeeded
+                feature_coverage[ext_name] = status == "success"
+
+            # Part 12: track remote inference version
+            if hasattr(context, 'model_versions') and "remote_inference" in context.model_versions:
+                feature_coverage["remote_inference_version"] = context.model_versions[
+                    "remote_inference"
+                ]
+
+            # Build extractor_failures: only failed (not skipped) extractors
+            extractor_failures: dict[str, str] = {}
+            for ext_name, entry in (context.intermediate_outputs or {}).items():
+                if ext_name == "projections" or ext_name.startswith("_"):
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("status") == "failed":
+                    extractor_failures[ext_name] = str(entry.get("error") or "unknown")[
+                        :200
+                    ]
+
             values = {
                 "reel_id": _uuid(rid),
                 "hook_score": proj_feats.get("hook_score"),
@@ -249,23 +278,32 @@ def persist_from_context(
                 "trend_score": proj_feats.get("trend_score"),
                 "confidence": proj_feats.get("confidence"),
                 "projection_version": proj_feats.get("projection_version"),
+                "feature_coverage": feature_coverage,
+                "extractor_failures": extractor_failures,
             }
             stmt = insert(ReelProjections).values(**values)
-            update_cols = [
+            # COALESCE for projection scores; FULL OVERWRITE for coverage/failures
+            coalesce_cols = [
                 "hook_score",
                 "pacing_score",
                 "trend_score",
                 "confidence",
                 "projection_version",
             ]
+            set_map = _coalesce_update(stmt, ReelProjections, coalesce_cols)
+            # Full overwrite on re-run (not COALESCE)
+            set_map["feature_coverage"] = stmt.excluded.feature_coverage
+            set_map["extractor_failures"] = stmt.excluded.extractor_failures
             stmt = stmt.on_conflict_do_update(
                 index_elements=[ReelProjections.reel_id],
-                set_=_coalesce_update(stmt, ReelProjections, update_cols),
+                set_=set_map,
             )
             session.execute(stmt)
             logger.debug(
-                "projection_keys_persisted keys=%s",
+                "projection_keys_persisted keys=%s coverage_count=%d failures=%s",
                 sorted(proj_feats.keys()),
+                sum(1 for v in feature_coverage.values() if v),
+                list(extractor_failures.keys()) or "none",
                 extra={"reel_id": rid},
             )
 
@@ -293,6 +331,14 @@ def persist_from_context(
                     emb_vector,
                 )
             ):
+                # Read clip_embedding from visual_embedding extractor (if present)
+                clip_vector = None
+                ve_entry = context.intermediate_outputs.get("visual_embedding") or {}
+                if isinstance(ve_entry, dict) and ve_entry.get("status") == "success":
+                    ve_feats = ve_entry.get("features")
+                    if isinstance(ve_feats, dict):
+                        clip_vector = ve_feats.get("clip_embedding")
+
                 values = {
                     "reel_id": _uuid(rid),
                     "embedding": emb_vector,
@@ -301,6 +347,9 @@ def persist_from_context(
                     "embedding_version": emb_version,
                     "text_bundle_hash": emb_hash,
                 }
+                if clip_vector is not None:
+                    values["clip_embedding"] = clip_vector
+
                 stmt = insert(ReelEmbeddings).values(**values)
                 update_cols = [
                     "embedding",
@@ -309,21 +358,19 @@ def persist_from_context(
                     "embedding_version",
                     "text_bundle_hash",
                 ]
-                # Only overwrite embedding when model or embedding version changes.
+                set_map = _coalesce_update(stmt, ReelEmbeddings, update_cols)
+                # clip_embedding: full overwrite (always recomputed)
+                if clip_vector is not None:
+                    set_map["clip_embedding"] = stmt.excluded.clip_embedding
+
                 stmt = stmt.on_conflict_do_update(
                     index_elements=[ReelEmbeddings.reel_id],
-                    set_=_coalesce_update(stmt, ReelEmbeddings, update_cols),
-                    where=(
-                        (ReelEmbeddings.model_name != stmt.excluded.model_name)
-                        | (ReelEmbeddings.model_version != stmt.excluded.model_version)
-                        | (
-                            ReelEmbeddings.embedding_version
-                            != stmt.excluded.embedding_version
-                        )
-                    ),
+                    set_=set_map,
                 )
                 session.execute(stmt)
                 logger.debug(
-                    "embedding_persisted=True",
+                    "embedding_persisted=True embedding_dim=%d clip_dim=%d",
+                    len(emb_vector) if isinstance(emb_vector, list) else 0,
+                    len(clip_vector) if isinstance(clip_vector, list) else 0,
                     extra={"reel_id": rid},
                 )

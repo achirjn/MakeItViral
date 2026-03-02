@@ -65,15 +65,31 @@ class HookExtractor(BaseExtractor):
     def requires_gpu(self) -> bool:
         return False
 
+    @property
+    def produces(self) -> set[str]:
+        return {"hook_score", "hook_confidence", "hook_ocr_present"}
+
+    @property
+    def requires(self) -> set[str]:
+        return {"motion_score"}
+
+    @property
+    def optional_requires(self) -> set[str]:
+        return {"ocr"}
+
     async def run(self, context: ExtractionContext) -> ExtractorResult:
         motion_entry = context.intermediate_outputs.get("motion") or {}
-        motion_feats = motion_entry.get("features") if isinstance(motion_entry, dict) else None
+        motion_feats = (
+            motion_entry.get("features") if isinstance(motion_entry, dict) else None
+        )
         if not isinstance(motion_feats, dict):
             return ExtractorResult.failed("missing_motion_features")
 
         motion_score = motion_feats.get("motion_score")
         scene_change_rate = motion_feats.get("scene_change_rate")
-        if not isinstance(motion_score, (int, float)) or not isinstance(scene_change_rate, (int, float)):
+        if not isinstance(motion_score, (int, float)) or not isinstance(
+            scene_change_rate, (int, float)
+        ):
             return ExtractorResult.failed("invalid_motion_features")
 
         ocr_text = ""
@@ -93,7 +109,9 @@ class HookExtractor(BaseExtractor):
             signals.append("high_motion_energy")
         elif motion_score <= self._config.low_motion_threshold:
             signals.append("low_motion_energy")
-            recs.append("Add an early motion change (camera move, cut, gesture) in the first 1–2 seconds.")
+            recs.append(
+                "Add an early motion change (camera move, cut, gesture) in the first 1–2 seconds."
+            )
         else:
             signals.append("moderate_motion_energy")
 
@@ -101,7 +119,9 @@ class HookExtractor(BaseExtractor):
             signals.append("fast_scene_changes")
         else:
             signals.append("slow_scene_changes")
-            recs.append("Consider 1 additional early cut to increase pacing in the hook window.")
+            recs.append(
+                "Consider 1 additional early cut to increase pacing in the hook window."
+            )
 
         # OCR-based hook signals (optional)
         if ocr_present:
@@ -127,4 +147,3 @@ class HookExtractor(BaseExtractor):
                 "hook_ocr_present": bool(ocr_present),
             }
         )
-

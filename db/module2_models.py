@@ -124,6 +124,12 @@ class ReelProjections(Base):
     projection_version: Mapped[str] = mapped_column(
         String(64), nullable=False, server_default="v1_mvp"
     )
+    feature_coverage: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    extractor_failures: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -141,11 +147,14 @@ class ReelEmbeddings(Base):
         primary_key=True,
     )
 
-    embedding: Mapped[list[float] | None] = mapped_column(Vector(384), nullable=True)
+    embedding: Mapped[list[float]] = mapped_column(Vector(384), nullable=False)
     model_name: Mapped[str] = mapped_column(String(128), nullable=False)
     model_version: Mapped[str] = mapped_column(String(64), nullable=False)
     embedding_version: Mapped[str] = mapped_column(String(64), nullable=False)
     text_bundle_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    clip_embedding: Mapped[list[float] | None] = mapped_column(
+        Vector(768), nullable=True
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

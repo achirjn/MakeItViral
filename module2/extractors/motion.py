@@ -68,6 +68,14 @@ class MotionExtractor(BaseExtractor):
     def requires_gpu(self) -> bool:
         return False
 
+    @property
+    def produces(self) -> set[str]:
+        return {"motion_score", "scene_change_rate"}
+
+    @property
+    def requires(self) -> set[str]:
+        return {"frames"}
+
     async def run(self, context: ExtractionContext) -> ExtractorResult:
         if not context.sampled_frames:
             return ExtractorResult.failed("missing_sampled_frames")

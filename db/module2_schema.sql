@@ -76,6 +76,8 @@ CREATE TABLE IF NOT EXISTS reel_projections (
     trend_score DOUBLE PRECISION,
     confidence DOUBLE PRECISION,
     projection_version VARCHAR(64) NOT NULL DEFAULT 'v1_mvp',
+    feature_coverage JSONB NOT NULL DEFAULT '{}'::jsonb,
+    extractor_failures JSONB NOT NULL DEFAULT '{}'::jsonb,
 
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -84,14 +86,25 @@ CREATE TABLE IF NOT EXISTS reel_projections (
 CREATE TABLE IF NOT EXISTS reel_embeddings (
     reel_id UUID PRIMARY KEY REFERENCES reels(id) ON DELETE CASCADE,
 
-    embedding VECTOR(384),
+    embedding VECTOR(384) NOT NULL,
     model_name VARCHAR(128) NOT NULL,
     model_version VARCHAR(64) NOT NULL,
     embedding_version VARCHAR(64) NOT NULL,
     text_bundle_hash VARCHAR(64) NOT NULL,
+    clip_embedding VECTOR(768),
 
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE INDEX IF NOT EXISTS reel_embeddings_embedding_idx
+ON reel_embeddings
+USING ivfflat (embedding vector_cosine_ops)
+WITH (lists = 100);
+
+CREATE INDEX IF NOT EXISTS reel_embeddings_clip_idx
+ON reel_embeddings
+USING ivfflat (clip_embedding vector_cosine_ops)
+WITH (lists = 100);
 
 

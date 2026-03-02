@@ -43,7 +43,7 @@ def schedule_once(
 ) -> list[str]:
     """
     Select eligible reels and transition:
-      pending -> ready_for_processing
+      PENDING -> READY_FOR_PROCESSING
 
     Returns a list of scheduled reel_id values.
     """

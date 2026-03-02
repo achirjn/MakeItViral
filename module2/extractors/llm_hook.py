@@ -37,6 +37,22 @@ class LlmHookExtractor(BaseExtractor):
     def requires_gpu(self) -> bool:
         return False
 
+    @property
+    def produces(self) -> set[str]:
+        return {"llm_hook_score", "llm_hook_confidence"}
+
+    @property
+    def requires(self) -> set[str]:
+        return {"hook_score"}
+
+    @property
+    def optional_requires(self) -> set[str]:
+        return {"ocr", "transcript"}
+
+    @property
+    def heavy(self) -> bool:
+        return True
+
     async def run(self, context):
 
         # ---------- Gather inputs ----------

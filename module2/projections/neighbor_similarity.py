@@ -5,19 +5,40 @@ from module2.logging_config import get_logger
 
 logger = get_logger("projection.neighbor")
 
+MIN_NEIGHBOR_POOL = 1000
+
 
 def fetch_embedding_neighbors(session, reel_id, embedding_vector, k=5):
     """
     Retrieve k nearest neighbors using pgvector cosine similarity.
     Returns list of dicts with similarity and engagement metrics.
+
+    Cold-start safe: returns [] if embedding pool < MIN_NEIGHBOR_POOL.
     """
 
     if embedding_vector is None:
         return []
 
+    # Cold-start guard: skip if insufficient embedding pool
+    try:
+        count_result = session.execute(text("SELECT COUNT(*) FROM reel_embeddings"))
+        pool_size = count_result.scalar() or 0
+    except Exception:  # noqa: BLE001
+        pool_size = 0
+
+    if pool_size < MIN_NEIGHBOR_POOL:
+        logger.info(
+            "similarity_skipped_cold_start pool_size=%d min_required=%d",
+            pool_size,
+            MIN_NEIGHBOR_POOL,
+            extra={"reel_id": reel_id},
+        )
+        return []
+
     logger.debug(
-        "neighbor_query_started k=%d",
+        "neighbor_query_started k=%d pool_size=%d",
         k,
+        pool_size,
         extra={"reel_id": reel_id},
     )
 

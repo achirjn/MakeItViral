@@ -1,0 +1,5127 @@
+MODULE 2 - FULL CODEBASE DUMP
+================================================================================
+
+================================================================================
+module2\context.py
+================================================================================
+
+from __future__ import annotations
+
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+
+@dataclass
+class ExtractionContext:
+    reel_id: str
+
+    # Ephemeral artifacts (must be cleaned up)
+    temp_dir: str
+    video_path: Optional[str] = None
+    audio_path: Optional[str] = None
+    sampled_frames: List[str] = field(default_factory=list)
+
+    # Metadata snapshot + intermediate extractor outputs
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    intermediate_outputs: Dict[str, Any] = field(default_factory=dict)
+    model_versions: Dict[str, str] = field(default_factory=dict)
+
+    @classmethod
+    def create(cls, reel_id: str, metadata: Dict[str, Any] | None = None) -> "ExtractionContext":
+        tmp = tempfile.mkdtemp(prefix=f"reel_{reel_id}_")
+        return cls(
+            reel_id=reel_id,
+            temp_dir=tmp,
+            metadata=metadata or {},
+        )
+
+    def temp_path(self) -> Path:
+        return Path(self.temp_dir)
+
+
+
+================================================================================
+module2\logging_config.py
+================================================================================
+
+"""
+Module 2 — Production-grade structured logging configuration.
+
+Usage:
+    from module2.logging_config import get_logger
+    logger = get_logger("worker")
+    logger.info("event", extra={"reel_id": reel_id})
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import sys
+
+
+_LOG_FORMAT = (
+    "%(asctime)s | %(levelname)-8s | %(name)s | reel_id=%(reel_id)s | %(message)s"
+)
+_DATE_FORMAT = "%Y-%m-%dT%H:%M:%S%z"
+_DEFAULT_LEVEL = "INFO"
+
+_CONFIGURED = False
+
+
+class _ReelContextFilter(logging.Filter):
+    """Inject a default reel_id into every record if not already present."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "reel_id"):
+            record.reel_id = "-"  # type: ignore[attr-defined]
+        return True
+
+
+def _configure_root() -> None:
+    global _CONFIGURED
+    if _CONFIGURED:
+        return
+
+    level_name = os.getenv("LOG_LEVEL", _DEFAULT_LEVEL).upper()
+    level = getattr(logging, level_name, logging.INFO)
+
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setLevel(level)
+    handler.setFormatter(logging.Formatter(_LOG_FORMAT, datefmt=_DATE_FORMAT))
+    handler.addFilter(_ReelContextFilter())
+
+    root = logging.getLogger("module2")
+    root.setLevel(level)
+    root.addHandler(handler)
+    root.propagate = False
+
+    _CONFIGURED = True
+
+
+def get_logger(name: str) -> logging.Logger:
+    """Return a child logger under the module2 namespace."""
+    _configure_root()
+    return logging.getLogger(f"module2.{name}")
+
+
+================================================================================
+module2\config.py
+================================================================================
+
+"""
+Module 2 — Remote Inference Configuration
+------------------------------------------
+Central config for remote GPU inference via Colab.
+"""
+
+from __future__ import annotations
+
+# When True, transcript + embedding extractors use remote Colab endpoint.
+# When False, extractors fall back to local inference (if available).
+USE_REMOTE_INFERENCE = True
+
+# Colab ngrok endpoint. Update this when a new Colab session starts.
+REMOTE_INFERENCE_URL = "https://<ngrok_url>/process_reel"
+
+# Hard timeout for remote HTTP call.
+REMOTE_TIMEOUT_SECONDS = 240
+
+
+================================================================================
+module2\cleanup.py
+================================================================================
+
+from __future__ import annotations
+
+import os
+import shutil
+from pathlib import Path
+
+from module2.context import ExtractionContext
+from module2.logging_config import get_logger
+
+
+logger = get_logger("cleanup")
+
+
+def _safe_remove_file(path: str | None, reel_id: str) -> bool:
+    if not path:
+        return False
+    try:
+        p = Path(path)
+        if p.exists():
+            p.unlink()
+            return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "cleanup_partial_failure type=file error=%s",
+            str(exc)[:80],
+            extra={"reel_id": reel_id},
+        )
+    return False
+
+
+def _safe_remove_dir(path: str | None, reel_id: str) -> bool:
+    if not path:
+        return False
+    try:
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+            return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "cleanup_partial_failure type=dir error=%s",
+            str(exc)[:80],
+            extra={"reel_id": reel_id},
+        )
+    return False
+
+
+def cleanup_context(context: ExtractionContext) -> None:
+    """
+    Cleanup guarantee: always attempt to delete ephemeral artifacts.
+    """
+    rid = context.reel_id
+    logger.debug("cleanup_started", extra={"reel_id": rid})
+
+    frame_count = 0
+    for frame_path in list(context.sampled_frames):
+        if _safe_remove_file(frame_path, rid):
+            frame_count += 1
+    logger.debug(
+        "frame_count_removed=%d",
+        frame_count,
+        extra={"reel_id": rid},
+    )
+
+    audio_removed = _safe_remove_file(context.audio_path, rid)
+    logger.debug(
+        "audio_removed=%s",
+        audio_removed,
+        extra={"reel_id": rid},
+    )
+
+    video_removed = _safe_remove_file(context.video_path, rid)
+    logger.debug(
+        "video_removed=%s",
+        video_removed,
+        extra={"reel_id": rid},
+    )
+
+    temp_removed = _safe_remove_dir(context.temp_dir, rid)
+    logger.debug(
+        "temp_dir_removed=%s",
+        temp_removed,
+        extra={"reel_id": rid},
+    )
+
+
+================================================================================
+module2\job_fetcher.py
+================================================================================
+
+from __future__ import annotations
+
+from typing import Optional
+
+from sqlalchemy import desc, func, select
+from sqlalchemy.orm import Session
+
+from db.models import IngestionStatus, Reel
+
+
+def claim_next_reel(session: Session) -> Optional[Reel]:
+    """
+    Claim the next reel ready for processing using row-level locking.
+
+    This does NOT persist worker lifecycle state (Phase 2 requirement).
+    Locking ensures that concurrent workers do not claim the same row while
+    the current transaction is open.
+    """
+    likes = func.coalesce(Reel.likes, 0)
+    comments = func.coalesce(Reel.comments, 0)
+    views = func.coalesce(Reel.views, 0)
+    priority = likes + comments + (views * 0.001)
+
+    stmt = (
+        select(Reel)
+        .where(Reel.ingestion_status == IngestionStatus.READY_FOR_PROCESSING.value)
+        .order_by(desc(priority), desc(Reel.publish_time).nullslast())
+        .limit(1)
+        .with_for_update(skip_locked=True)
+    )
+    return session.execute(stmt).scalars().one_or_none()
+
+
+def peek_next_reel_id(session: Session) -> Optional[str]:
+    """
+    Lockless peek: returns the reel_id of the next eligible reel
+    WITHOUT acquiring a row lock. Used for pre-claim cooldown checks.
+    """
+    likes = func.coalesce(Reel.likes, 0)
+    comments = func.coalesce(Reel.comments, 0)
+    views = func.coalesce(Reel.views, 0)
+    priority = likes + comments + (views * 0.001)
+
+    stmt = (
+        select(Reel.id)
+        .where(Reel.ingestion_status == IngestionStatus.READY_FOR_PROCESSING.value)
+        .order_by(desc(priority), desc(Reel.publish_time).nullslast())
+        .limit(1)
+    )
+    result = session.execute(stmt).scalar_one_or_none()
+    return str(result) if result is not None else None
+
+
+================================================================================
+module2\remote_inference.py
+================================================================================
+
+"""
+Module 2 — Remote Inference Client
+------------------------------------
+Single HTTP call per reel to Colab GPU server.
+Caches result in context.intermediate_outputs["_remote_inference"].
+"""
+
+from __future__ import annotations
+
+import time
+from typing import Any
+
+import httpx
+
+from module2.config import (
+    INFERENCE_VERSION,
+    REMOTE_INFERENCE_URL,
+    REMOTE_TIMEOUT_SECONDS,
+)
+from module2.logging_config import get_logger
+
+
+logger = get_logger("remote_inference")
+
+# Context key for cached result
+_REMOTE_KEY = "_remote_inference"
+
+
+async def call_remote_inference(
+    context: Any,
+    video_url: str,
+) -> dict | None:
+    """
+    Call the Colab inference server for a single reel.
+
+    - Caches result in context.intermediate_outputs["_remote_inference"]
+    - Guard: if result already cached, returns it without calling again.
+    - On failure: returns None, logs error.
+
+    Returns the parsed response dict or None.
+    """
+    # Guard: do NOT call again if already cached
+    existing = context.intermediate_outputs.get(_REMOTE_KEY)
+    if existing is not None:
+        logger.debug(
+            "remote_inference_cached_hit",
+            extra={"reel_id": context.reel_id},
+        )
+        return existing if isinstance(existing, dict) else None
+
+    reel_id = context.reel_id
+
+    logger.info(
+        "remote_request_started url=%s",
+        REMOTE_INFERENCE_URL,
+        extra={"reel_id": reel_id},
+    )
+
+    t0 = time.monotonic()
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(REMOTE_TIMEOUT_SECONDS, connect=30.0)
+        ) as client:
+            resp = await client.post(
+                REMOTE_INFERENCE_URL,
+                json={
+                    "reel_id": reel_id,
+                    "video_url": video_url,
+                },
+            )
+
+        elapsed = round(time.monotonic() - t0, 2)
+
+        if resp.status_code != 200:
+            error_detail = resp.text[:200]
+            logger.error(
+                "remote_request_failed status=%d reason=%s duration=%.2f",
+                resp.status_code,
+                error_detail,
+                elapsed,
+                extra={"reel_id": reel_id},
+            )
+            context.intermediate_outputs[_REMOTE_KEY] = {
+                "status": "failed",
+                "failure_type": "http_error",
+                "error": f"HTTP {resp.status_code}: {error_detail}",
+            }
+            return None
+
+        data = resp.json()
+
+        # Basic JSON validation first
+        if not isinstance(data, dict):
+            raise ValueError("invalid_json_object")
+
+        # Strict schema validation
+        required_keys = [
+            "transcript",
+            "transcript_confidence",
+            "text_embedding",
+            "text_dim",
+            "clip_embedding",
+            "clip_dim",
+            "inference_version",
+        ]
+
+        for key in required_keys:
+            if key not in data:
+                raise ValueError(f"missing_key:{key}")
+
+        # Strict dimension validation
+        if data["text_dim"] != 384:
+            raise ValueError("invalid_text_dim")
+
+        if data["clip_dim"] != 768:
+            raise ValueError("invalid_clip_dim")
+
+        if not isinstance(data["text_embedding"], list) or len(data["text_embedding"]) != 384:
+            raise ValueError("invalid_text_embedding_vector")
+
+        if not isinstance(data["clip_embedding"], list) or len(data["clip_embedding"]) != 768:
+            raise ValueError("invalid_clip_embedding_vector")
+
+        if not all(isinstance(x, (int, float)) for x in data["text_embedding"]):
+            raise ValueError("text_embedding_non_numeric")
+
+        if not all(isinstance(x, (int, float)) for x in data["clip_embedding"]):
+            raise ValueError("clip_embedding_non_numeric")
+
+        # Store inference version in context model_versions
+        if hasattr(context, 'model_versions'):
+            context.model_versions["remote_inference"] = data.get("inference_version")
+
+        logger.info(
+            "remote_request_success duration=%.2fs "
+            "transcript_len=%d text_dim=%d clip_dim=%d "
+            "inference_version=%s",
+            elapsed,
+            len(data.get("transcript") or ""),
+            data.get("text_dim", 0),
+            data.get("clip_dim", 0),
+            data.get("inference_version", "unknown"),
+            extra={"reel_id": reel_id},
+        )
+
+        # Cache in context
+        context.intermediate_outputs[_REMOTE_KEY] = data
+        return data
+
+    except ValueError as ve:
+        elapsed = round(time.monotonic() - t0, 2)
+        failure_type = "schema_error"
+        if "dim" in str(ve):
+            failure_type = "dim_error"
+        
+        logger.error(
+            "remote_request_failed reason=%s duration=%.2f error=%s",
+            failure_type,
+            elapsed,
+            str(ve)[:120],
+            extra={"reel_id": reel_id},
+        )
+        context.intermediate_outputs[_REMOTE_KEY] = {
+            "status": "failed",
+            "failure_type": failure_type,
+            "error": str(ve)[:200],
+        }
+        return None
+
+    except httpx.TimeoutException:
+        elapsed = round(time.monotonic() - t0, 2)
+        logger.error(
+            "remote_request_failed reason=timeout duration=%.2f limit=%d",
+            elapsed,
+            REMOTE_TIMEOUT_SECONDS,
+            extra={"reel_id": reel_id},
+        )
+        context.intermediate_outputs[_REMOTE_KEY] = {
+            "status": "failed",
+            "failure_type": "timeout",
+            "error": f"timeout after {REMOTE_TIMEOUT_SECONDS}s",
+        }
+        return None
+
+    except Exception as exc:  # noqa: BLE001
+        elapsed = round(time.monotonic() - t0, 2)
+        logger.error(
+            "remote_request_failed reason=%s duration=%.2f",
+            str(exc)[:120],
+            elapsed,
+            extra={"reel_id": reel_id},
+        )
+        context.intermediate_outputs[_REMOTE_KEY] = {
+            "status": "failed",
+            "failure_type": "http_error" if "http" in str(exc).lower() else "unknown_error",
+            "error": str(exc)[:200],
+        }
+        return None
+
+
+================================================================================
+module2\planner.py
+================================================================================
+
+"""
+Module 2 — Two-Phase Adaptive Activation Planner
+-------------------------------------------------
+Determines which extractors to run based on projection demand.
+
+Phase A (baseline): extractors needed for REQUIRED_PROJECTION_FEATURES
+                    plus infrastructure features (audio).
+Phase B (adaptive): heavy extractors activated by heuristic signals
+                    after baseline execution.
+
+Planner is deterministic and side-effect free.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+from typing import Sequence
+
+from module2.logging_config import get_logger
+from module2.projections.engine import REQUIRED_PROJECTION_FEATURES
+
+
+logger = get_logger("planner")
+
+# Infrastructure features that must always be in baseline even if
+# not directly consumed by projections (needed by adaptive phase).
+_BASELINE_EXTRAS: set[str] = {"embedding", "clip_embedding"}
+
+
+# ---------------------------------------------------------------------------
+# Topological sort (Kahn's algorithm)
+# ---------------------------------------------------------------------------
+
+
+def topo_sort_extractors(extractors: Sequence) -> list:
+    """
+    Topologically sort extractors by their DAG `dependencies` property.
+    Preserves insertion order for ties.
+    """
+    name_map = {e.name: e for e in extractors}
+    in_degree: dict[str, int] = {e.name: 0 for e in extractors}
+    adj: dict[str, list[str]] = {e.name: [] for e in extractors}
+
+    active_names = set(name_map.keys())
+
+    for e in extractors:
+        for dep in e.dependencies:
+            if dep in active_names:
+                adj[dep].append(e.name)
+                in_degree[e.name] += 1
+
+    queue: deque[str] = deque(n for n in in_degree if in_degree[n] == 0)
+    ordered: list = []
+
+    while queue:
+        name = queue.popleft()
+        ordered.append(name_map[name])
+        for child in adj.get(name, []):
+            in_degree[child] -= 1
+            if in_degree[child] == 0:
+                queue.append(child)
+
+    return ordered
+
+
+# ---------------------------------------------------------------------------
+# Dependency closure (Fix 5)
+# ---------------------------------------------------------------------------
+
+
+def _compute_dependency_closure(
+    demand: set[str],
+    extractors: Sequence,
+) -> set[str]:
+    """
+    Expand demand to full closure:
+    - Add hard requires of any extractor whose produces overlap demand.
+    - Add optional_requires ONLY if they are already in demand.
+    Iterates until stable.
+    """
+    changed = True
+    while changed:
+        changed = False
+        for e in extractors:
+            if e.produces & demand:
+                # Hard requirements — always pull in
+                for dep in e.requires:
+                    if dep not in demand:
+                        demand.add(dep)
+                        changed = True
+                # Optional — only if already demanded (Fix 2)
+                for dep in e.optional_requires:
+                    if dep in demand and dep not in demand:
+                        demand.add(dep)
+                        changed = True
+    return demand
+
+
+# ---------------------------------------------------------------------------
+# Backward demand propagation
+# ---------------------------------------------------------------------------
+
+
+def _resolve_demand(
+    demand: set[str],
+    extractors: Sequence,
+) -> list:
+    """
+    Given a set of demanded logical features, backward-propagate
+    through the extractor graph and return all extractors needed
+    to produce those features (including transitive dependencies).
+    """
+    # Full closure first (Fix 5)
+    demand = _compute_dependency_closure(set(demand), extractors)
+
+    logger.debug(
+        "resolve_demand_closure features=%s",
+        sorted(demand),
+    )
+
+    # Build produces → extractor lookup
+    producer_map: dict[str, object] = {}
+    for e in extractors:
+        for feat in e.produces:
+            producer_map[feat] = e
+
+    activated: set[str] = set()  # extractor names
+    work: deque[str] = deque(demand)
+
+    while work:
+        feat = work.popleft()
+        producer = producer_map.get(feat)
+        if producer is None or producer.name in activated:
+            continue
+
+        activated.add(producer.name)
+        # Hard requirements only (Fix 2: optional_requires do NOT create edges)
+        for req_feat in producer.requires:
+            if req_feat not in demand:
+                demand.add(req_feat)
+                work.append(req_feat)
+
+    return [e for e in extractors if e.name in activated]
+
+
+# ---------------------------------------------------------------------------
+# Phase A — baseline extractors
+# ---------------------------------------------------------------------------
+
+
+def plan_baseline_extractors(extractors: Sequence) -> list:
+    """
+    Return the minimal extractor subset needed to compute
+    REQUIRED_PROJECTION_FEATURES plus infrastructure features,
+    topologically sorted.
+    """
+    # Fix 1: include audio in baseline for transcript gating
+    baseline_demand = set(REQUIRED_PROJECTION_FEATURES) | _BASELINE_EXTRAS
+
+    logger.debug(
+        "activation_plan_demand phase=baseline features=%s",
+        sorted(baseline_demand),
+    )
+
+    active = _resolve_demand(baseline_demand, extractors)
+
+    logger.info(
+        "activation_plan phase=baseline extractors=%s",
+        [e.name for e in active],
+    )
+
+    return topo_sort_extractors(active)
+
+
+# ---------------------------------------------------------------------------
+# Phase B — adaptive extractors
+# ---------------------------------------------------------------------------
+
+
+def plan_adaptive_extractors(
+    extractors: Sequence,
+    context,
+) -> list:
+    """
+    After baseline execution, decide which heavy extractors to activate
+    based on heuristic signals available in context.
+
+    Returns topologically sorted extractors that are NOT in baseline.
+    """
+    baseline_names = {e.name for e in plan_baseline_extractors(extractors)}
+    demand: set[str] = set()
+
+    # --- Read heuristic signals from intermediate outputs ---
+    hook_entry = context.intermediate_outputs.get("hook") or {}
+    hook_feats = (
+        (hook_entry.get("features") or {}) if isinstance(hook_entry, dict) else {}
+    )
+    hook_score = hook_feats.get("hook_motion_score")
+    scene_rate = hook_feats.get("hook_scene_change_rate")
+
+    motion_entry = context.intermediate_outputs.get("motion") or {}
+    motion_feats = (
+        (motion_entry.get("features") or {}) if isinstance(motion_entry, dict) else {}
+    )
+    motion_score = motion_feats.get("motion_score")
+
+    metadata = context.metadata or {}
+
+    # --- Heuristic 1: gray-zone hook → LLM hook ---
+    if isinstance(hook_score, (int, float)) and 0.25 <= hook_score <= 0.75:
+        demand.update({"llm_hook_score", "llm_hook_confidence"})
+
+    if not demand:
+        logger.debug(
+            "activation_plan phase=adaptive result=no_demand",
+            extra={"reel_id": context.reel_id},
+        )
+        return []
+
+    logger.debug(
+        "activation_plan_demand phase=adaptive features=%s",
+        sorted(demand),
+        extra={"reel_id": context.reel_id},
+    )
+
+    # Resolve all extractors needed
+    all_active = _resolve_demand(demand, extractors)
+
+    # Exclude extractors already in baseline (Fix 6: name-based dedup)
+    adaptive_only = [e for e in all_active if e.name not in baseline_names]
+
+    if adaptive_only:
+        logger.info(
+            "activation_plan phase=adaptive extractors=%s",
+            [e.name for e in adaptive_only],
+            extra={"reel_id": context.reel_id},
+        )
+
+    return topo_sort_extractors(adaptive_only)
+
+
+================================================================================
+module2\engagement_lifecycle.py
+================================================================================
+
+"""
+Module 2 — Engagement Lifecycle Evaluator
+=========================================
+Evaluates engagement stability and updates reel lifecycle status.
+
+This module handles dataset management logic for engagement tracking,
+determining which reels are suitable for training based on age and
+engagement data availability.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from module2.logging_config import get_logger
+
+
+logger = get_logger("engagement_lifecycle")
+
+
+def evaluate_engagement_stability(reel: Any) -> None:
+    """
+    Updates engagement lifecycle fields on a reel object.
+    
+    Updates:
+        reel.engagement_status
+        reel.stability_score  
+        reel.is_active_for_training
+    
+    Note: Does NOT update engagement_last_updated_at or engagement_fetch_attempts
+    These are managed by the engagement_updater to prevent double incrementing.
+    
+    Rules:
+    1. If views OR likes is NULL: status="missing", training=False, score=0.0
+    2. If age_days < 3: status="unstable", training=False, score=0.2
+    3. If age_days >= 5: status="stable", training=True, score=1.0
+    4. Otherwise: status="unstable", training=False, score=0.5
+    """
+    # Note: engagement_fetch_attempts and engagement_last_updated_at 
+    # are managed by engagement_updater to prevent double incrementing
+    
+    # Rule 1: Check engagement data availability
+    if not hasattr(reel, 'views') or not hasattr(reel, 'likes'):
+        logger.warning(
+            "engagement_evaluation_missing_fields reel_id=%s",
+            getattr(reel, 'id', 'unknown'),
+            extra={"reel_id": getattr(reel, 'id', None)}
+        )
+        return
+    
+    if reel.views is None or reel.likes is None:
+        old_status = getattr(reel, 'engagement_status', 'unknown')
+        reel.engagement_status = "missing"
+        reel.is_active_for_training = False
+        reel.stability_score = 0.0
+        
+        logger.info(
+            "engagement_status_missing reel_id=%s views=%s likes=%s old_status=%s",
+            getattr(reel, 'id', 'unknown'),
+            reel.views,
+            reel.likes,
+            old_status,
+            extra={"reel_id": getattr(reel, 'id', None)}
+        )
+        return
+    
+    # Rule 2: Compute reel age
+    if not hasattr(reel, 'publish_time') or reel.publish_time is None:
+        logger.warning(
+            "engagement_evaluation_no_publish_time reel_id=%s",
+            getattr(reel, 'id', 'unknown'),
+            extra={"reel_id": getattr(reel, 'id', None)}
+        )
+        # Default to unstable if no publish time
+        old_status = getattr(reel, 'engagement_status', 'unknown')
+        reel.engagement_status = "unstable"
+        reel.is_active_for_training = False
+        reel.stability_score = 0.2
+        
+        logger.info(
+            "engagement_status_no_publish_time reel_id=%s status=unstable",
+            getattr(reel, 'id', 'unknown'),
+            extra={"reel_id": getattr(reel, 'id', None)}
+        )
+        return
+    
+    # Import datetime only when needed for age calculation
+    from datetime import datetime
+    age_days = (datetime.utcnow() - reel.publish_time).days
+    old_status = getattr(reel, 'engagement_status', 'unknown')
+    
+    # Rule 3: Very recent reels (< 3 days) are unstable
+    if age_days < 3:
+        reel.engagement_status = "unstable"
+        reel.is_active_for_training = False
+        reel.stability_score = 0.2
+        
+        logger.info(
+            "engagement_status_unstable_young reel_id=%s age_days=%d views=%s likes=%s old_status=%s",
+            getattr(reel, 'id', 'unknown'),
+            age_days,
+            reel.views,
+            reel.likes,
+            old_status,
+            extra={"reel_id": getattr(reel, 'id', None)}
+        )
+        return
+    
+    # Rule 4: Mature reels (>= 5 days) are stable
+    if age_days >= 5:
+        reel.engagement_status = "stable"
+        reel.is_active_for_training = True
+        reel.stability_score = 1.0
+        
+        logger.info(
+            "engagement_status_stable_mature reel_id=%s age_days=%d views=%s likes=%s old_status=%s",
+            getattr(reel, 'id', 'unknown'),
+            age_days,
+            reel.views,
+            reel.likes,
+            old_status,
+            extra={"reel_id": getattr(reel, 'id', None)}
+        )
+        return
+    
+    # Rule 5: Intermediate age (3-4 days) are unstable but not missing
+    reel.engagement_status = "unstable"
+    reel.is_active_for_training = False
+    reel.stability_score = 0.5
+    
+    logger.info(
+        "engagement_status_unstable_intermediate reel_id=%s age_days=%d views=%s likes=%s old_status=%s",
+        getattr(reel, 'id', 'unknown'),
+        age_days,
+        reel.views,
+        reel.likes,
+        old_status,
+        extra={"reel_id": getattr(reel, 'id', None)}
+    )
+
+
+================================================================================
+module2\engagement_updater.py
+================================================================================
+
+"""
+Module 2 — Engagement Refresh Job
+==================================
+Periodically updates engagement metrics and evaluates stability.
+
+This module handles the dynamic updating of engagement lifecycle fields
+for reels that need engagement data refreshes.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+
+from sqlalchemy.orm import Session
+
+from module2.engagement_lifecycle import evaluate_engagement_stability
+from module2.logging_config import get_logger
+
+
+logger = get_logger("engagement_updater")
+
+
+def refresh_engagement_metrics(session: Session) -> None:
+    """
+    Updates engagement metrics for all reels and evaluates stability.
+    
+    For each reel:
+        - update engagement_last_updated_at
+        - increment engagement_fetch_attempts  
+        - call evaluate_engagement_stability(reel)
+    
+    Args:
+        session: SQLAlchemy database session
+        
+    Returns:
+        None (commits changes to database)
+    """
+    from db.models import Reel
+    
+    now = datetime.utcnow()
+    updated_count = 0
+    error_count = 0
+    
+    logger.info(
+        "engagement_refresh_started",
+        extra={"reel_id": None}
+    )
+    
+    try:
+        # Query all reels for engagement refresh with batch processing
+        reels = session.query(Reel).yield_per(500)
+        
+        logger.info(
+            "engagement_refresh_processing_started",
+            extra={"reel_id": None}
+        )
+        
+        for reel in reels:
+            try:
+                # Update engagement tracking fields
+                reel.engagement_last_updated_at = now
+                reel.engagement_fetch_attempts += 1
+                
+                # Evaluate stability based on current data
+                evaluate_engagement_stability(reel)
+                
+                updated_count += 1
+                
+                if updated_count % 100 == 0:
+                    logger.debug(
+                        "engagement_refresh_progress processed=%d",
+                        updated_count,
+                        extra={"reel_id": reel.id}
+                    )
+                    
+            except Exception as exc:
+                error_count += 1
+                logger.error(
+                    "engagement_refresh_error reel_id=%s error=%s",
+                    reel.id,
+                    str(exc)[:120],
+                    extra={"reel_id": reel.id}
+                )
+                # Continue processing other reels
+                continue
+        
+        # Commit all changes
+        session.commit()
+        
+        logger.info(
+            "engagement_refresh_completed updated=%d errors=%d",
+            updated_count,
+            error_count,
+            extra={"reel_id": None}
+        )
+        
+    except Exception as exc:
+        session.rollback()
+        logger.error(
+            "engagement_refresh_failed error=%s",
+            str(exc)[:120],
+            extra={"reel_id": None}
+        )
+        raise
+
+
+================================================================================
+module2\extractors\base.py
+================================================================================
+
+from __future__ import annotations
+
+import time
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+from module2.context import ExtractionContext
+from module2.logging_config import get_logger
+
+
+_ext_logger = get_logger("extractor")
+
+
+@dataclass(frozen=True)
+class ExtractorResult:
+    """
+    Locked result schema:
+      { status: success|failed|skipped, features: dict, error?: str }
+    """
+
+    status: str
+    features: Dict[str, Any]
+    error: Optional[str] = None
+
+    @staticmethod
+    def success(features: Dict[str, Any]) -> "ExtractorResult":
+        return ExtractorResult(status="success", features=features, error=None)
+
+    @staticmethod
+    def failed(error: str) -> "ExtractorResult":
+        return ExtractorResult(status="failed", features={}, error=error)
+
+    @staticmethod
+    def skipped(reason: str) -> "ExtractorResult":
+        return ExtractorResult(status="skipped", features={}, error=reason)
+
+
+class BaseExtractor(ABC):
+    """
+    Locked extractor interface contract.
+
+    Extractors must not write to DB.
+    The run_with_logging wrapper is the standard entry point used by the DAG
+    executor. It transparently adds timing and structured log events around
+    the concrete run() implementation without altering the extractor contract.
+    """
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def dependencies(self) -> List[str]:
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def output_keys(self) -> List[str]:
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def is_critical(self) -> bool:
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def requires_gpu(self) -> bool:
+        raise NotImplementedError
+
+    # ── Activation planner metadata (non-abstract, safe defaults) ──
+
+    @property
+    def produces(self) -> set[str]:
+        """Logical feature names this extractor produces."""
+        return set()
+
+    @property
+    def requires(self) -> set[str]:
+        """Logical feature names required before this extractor can run."""
+        return set()
+
+    @property
+    def optional_requires(self) -> set[str]:
+        """Logical features used if available, but not required."""
+        return set()
+
+    @property
+    def heavy(self) -> bool:
+        """True if extractor is expensive (ML model, external API, etc.)."""
+        return False
+
+    @abstractmethod
+    async def run(self, context: ExtractionContext) -> ExtractorResult:
+        raise NotImplementedError
+
+    async def run_with_logging(self, context: ExtractionContext) -> ExtractorResult:
+        """Auto-logging wrapper. Logs start, result, and duration."""
+        rid = context.reel_id
+        ext_name = self.name
+
+        _ext_logger.debug(
+            "extractor_start extractor=%s",
+            ext_name,
+            extra={"reel_id": rid},
+        )
+
+        t0 = time.monotonic()
+        result = await self.run(context)
+        elapsed = time.monotonic() - t0
+
+        if result.status == "success":
+            feature_keys = sorted(result.features.keys()) if result.features else []
+            _ext_logger.debug(
+                "extractor_success extractor=%s feature_keys=%s duration_s=%.3f",
+                ext_name,
+                feature_keys,
+                elapsed,
+                extra={"reel_id": rid},
+            )
+        elif result.status == "skipped":
+            _ext_logger.debug(
+                "extractor_skipped extractor=%s reason=%s duration_s=%.3f",
+                ext_name,
+                result.error,
+                elapsed,
+                extra={"reel_id": rid},
+            )
+        elif result.status == "failed":
+            _ext_logger.warning(
+                "extractor_failed extractor=%s error=%s duration_s=%.3f",
+                ext_name,
+                result.error,
+                elapsed,
+                extra={"reel_id": rid},
+            )
+
+        return result
+
+
+================================================================================
+module2\extractors\registry.py
+================================================================================
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, List, Type
+
+from module2.extractors.base import BaseExtractor
+
+
+@dataclass
+class ExtractorRegistry:
+    """
+    Minimal registry for loading and enumerating extractors by name.
+    """
+
+    _extractors: Dict[str, Type[BaseExtractor]] = field(default_factory=dict)
+
+    def register(self, extractor_cls: Type[BaseExtractor]) -> None:
+        instance = extractor_cls()
+        name = instance.name
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Extractor instance must return a non-empty 'name'.")
+        if name in self._extractors:
+            raise ValueError(f"Extractor already registered: {name}")
+        self._extractors[name] = extractor_cls
+
+    def get(self, name: str) -> Type[BaseExtractor]:
+        if name not in self._extractors:
+            raise KeyError(f"Unknown extractor: {name}")
+        return self._extractors[name]
+
+    def all(self) -> List[BaseExtractor]:
+        """
+        Return instantiated extractor objects for DAG execution.
+        """
+        return [cls() for cls in self._extractors.values()]
+
+    def register_many(self, extractor_classes: Iterable[Type[BaseExtractor]]) -> None:
+        for cls in extractor_classes:
+            self.register(cls)
+
+
+def build_default_registry() -> ExtractorRegistry:
+    """
+    Convenience loader for the extractors implemented so far.
+    """
+    from module2.extractors.audio import AudioExtractor
+    from module2.extractors.embedding import EmbeddingExtractor
+    from module2.extractors.frame_sampler import FrameSamplerExtractor
+    from module2.extractors.hook import HookExtractor
+    from module2.extractors.llm_hook import LlmHookExtractor
+    from module2.extractors.motion import MotionExtractor
+    from module2.extractors.ocr import OcrExtractor
+    from module2.extractors.transcript import TranscriptExtractor
+    from module2.extractors.video_fetcher import VideoFetcherExtractor
+    from module2.extractors.video_probe import VideoProbeExtractor
+    from module2.extractors.visual_embedding import VisualEmbeddingExtractor
+
+    reg = ExtractorRegistry()
+    reg.register_many(
+        [
+            VideoFetcherExtractor,
+            VideoProbeExtractor,
+            FrameSamplerExtractor,
+            MotionExtractor,
+            OcrExtractor,
+            AudioExtractor,
+            TranscriptExtractor,
+            HookExtractor,
+            LlmHookExtractor,
+            EmbeddingExtractor,
+            VisualEmbeddingExtractor,
+        ]
+    )
+    return reg
+
+
+================================================================================
+module2\extractors\video_fetcher.py
+================================================================================
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+from pathlib import Path
+from typing import Any, Dict, List
+
+from yt_dlp import YoutubeDL
+
+from module2.context import ExtractionContext
+from module2.extractors.base import BaseExtractor, ExtractorResult
+from module2.logging_config import get_logger
+
+
+logger = get_logger("extractor.video_fetcher")
+
+
+def _storage_state_path(account_id: str) -> Path:
+    # Locked source-of-truth for auth state reuse (Module-1).
+    return Path("discovery") / "auth_state" / f"instagram_{account_id}.json"
+
+
+def _write_netscape_cookies(
+    storage_state_json_path: Path, cookie_file_path: Path
+) -> None:
+    """
+    Convert Playwright storageState cookies -> Netscape cookies.txt for yt-dlp.
+    """
+    data = json.loads(storage_state_json_path.read_text(encoding="utf-8"))
+    cookies = data.get("cookies") or []
+
+    lines: List[str] = [
+        "# Netscape HTTP Cookie File",
+        "# This file is generated automatically. Do not edit.",
+    ]
+
+    for c in cookies:
+        domain = c.get("domain") or ""
+        name = c.get("name") or ""
+        value = c.get("value") or ""
+        path = c.get("path") or "/"
+        secure = "TRUE" if c.get("secure") else "FALSE"
+
+        # Include subdomains if cookie is set for a parent domain.
+        include_subdomains = "TRUE" if domain.startswith(".") else "FALSE"
+
+        expires = c.get("expires")
+        try:
+            expires_int = int(expires) if expires not in (None, -1) else 0
+        except Exception:  # noqa: BLE001
+            expires_int = 0
+
+        if not (domain and name):
+            continue
+
+        # domain \t include_subdomains \t path \t secure \t expires \t name \t value
+        lines.append(
+            "\t".join(
+                [
+                    domain,
+                    include_subdomains,
+                    path,
+                    secure,
+                    str(expires_int),
+                    name,
+                    value,
+                ]
+            )
+        )
+
+    cookie_file_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+class VideoFetcherExtractor(BaseExtractor):
+    """
+    PHASE 4: Download reel video using authenticated cookies from Module-1 Playwright storageState.
+    Stores the temporary video path in context.video_path. Does not persist video.
+    """
+
+    @property
+    def name(self) -> str:
+        return "video_fetcher"
+
+    @property
+    def dependencies(self) -> List[str]:
+        return []
+
+    @property
+    def output_keys(self) -> List[str]:
+        return ["video_path", "video_download_seconds"]
+
+    @property
+    def is_critical(self) -> bool:
+        return True
+
+    @property
+    def requires_gpu(self) -> bool:
+        return False
+
+    @property
+    def produces(self) -> set[str]:
+        return {"video"}
+
+    async def run(self, context: ExtractionContext) -> ExtractorResult:
+        reel_url = (context.metadata.get("reel_url") or "").strip()
+        if not reel_url:
+            return ExtractorResult.failed("missing_reel_url")
+
+        account_id = (
+            context.metadata.get("account_id") or "default"
+        ).strip() or "default"
+        storage_state = _storage_state_path(account_id)
+        if not storage_state.exists():
+            return ExtractorResult.failed(f"missing_auth_state:{storage_state}")
+
+        tmp_dir = context.temp_path()
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        cookies_path = tmp_dir / f"cookies_{account_id}.txt"
+        _write_netscape_cookies(storage_state, cookies_path)
+
+        out_path = tmp_dir / f"{context.reel_id}.mp4"
+
+        start = time.time()
+        logger.debug(
+            "yt_dlp_invoked",
+            extra={"reel_id": context.reel_id},
+        )
+        try:
+            ydl_opts: Dict[str, Any] = {
+                "cookiefile": str(cookies_path),
+                "outtmpl": str(out_path),
+                "format": "mp4/best",
+                "noplaylist": True,
+                "quiet": True,
+                "no_warnings": True,
+            }
+            with YoutubeDL(ydl_opts) as ydl:
+                ydl.download([reel_url])
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "yt_dlp_failure error=%s",
+                exc,
+                extra={"reel_id": context.reel_id},
+            )
+            return ExtractorResult.failed(f"download_failed:{exc}")
+
+        if not out_path.exists():
+            return ExtractorResult.failed("download_failed:missing_output_file")
+
+        context.video_path = str(out_path)
+        elapsed = time.time() - start
+
+        return ExtractorResult.success(
+            {
+                "video_path": context.video_path,
+                "video_download_seconds": elapsed,
+            }
+        )
+
+
+================================================================================
+module2\extractors\video_probe.py
+================================================================================
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import subprocess
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
+from module2.context import ExtractionContext
+from module2.extractors.base import BaseExtractor, ExtractorResult
+from module2.logging_config import get_logger
+
+
+logger = get_logger("extractor.video_probe")
+
+
+def _parse_fraction(value: str) -> Optional[float]:
+    """
+    Parse ffprobe rate strings like "30000/1001" or "30/1".
+    """
+    if not value or not isinstance(value, str):
+        return None
+    if "/" not in value:
+        try:
+            return float(value)
+        except Exception:  # noqa: BLE001
+            return None
+    num_s, den_s = value.split("/", 1)
+    try:
+        num = float(num_s)
+        den = float(den_s)
+        if den == 0:
+            return None
+        return num / den
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _run_subprocess(cmd: List[str]) -> subprocess.CompletedProcess[str]:
+    return await asyncio.to_thread(
+        subprocess.run,
+        cmd,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+@dataclass(frozen=True)
+class VideoProbeConfig:
+    ffprobe_bin: str = "ffprobe"
+
+
+class VideoProbeExtractor(BaseExtractor):
+    """
+    PHASE 5: Use ffprobe to extract duration, fps, resolution.
+    """
+
+    def __init__(self, config: VideoProbeConfig | None = None) -> None:
+        self._config = config or VideoProbeConfig()
+
+    @property
+    def name(self) -> str:
+        return "video_probe"
+
+    @property
+    def dependencies(self) -> List[str]:
+        return ["video_fetcher"]
+
+    @property
+    def output_keys(self) -> List[str]:
+        return ["duration", "fps", "resolution", "width", "height"]
+
+    @property
+    def is_critical(self) -> bool:
+        return True
+
+    @property
+    def requires_gpu(self) -> bool:
+        return False
+
+    @property
+    def produces(self) -> set[str]:
+        return {"probe"}
+
+    @property
+    def requires(self) -> set[str]:
+        return {"video"}
+
+    async def run(self, context: ExtractionContext) -> ExtractorResult:
+        if not context.video_path:
+            return ExtractorResult.failed("missing_video_path")
+
+        cmd = [
+            self._config.ffprobe_bin,
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_streams",
+            "-show_format",
+            context.video_path,
+        ]
+
+        try:
+            proc = await _run_subprocess(cmd)
+        except FileNotFoundError:
+            return ExtractorResult.failed("ffprobe_not_found")
+        except subprocess.CalledProcessError as exc:
+            msg = (exc.stderr or exc.stdout or "").strip()
+            return ExtractorResult.failed(f"ffprobe_failed:{msg}")
+        except Exception as exc:  # noqa: BLE001
+            return ExtractorResult.failed(f"ffprobe_error:{exc}")
+
+        try:
+            payload: Dict[str, Any] = json.loads(proc.stdout or "{}")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ffprobe JSON parse failed: %s", exc)
+            return ExtractorResult.failed("ffprobe_invalid_json")
+
+        streams = payload.get("streams") or []
+        fmt = payload.get("format") or {}
+
+        video_stream = None
+        for s in streams:
+            if isinstance(s, dict) and s.get("codec_type") == "video":
+                video_stream = s
+                break
+
+        if not isinstance(video_stream, dict):
+            return ExtractorResult.failed("ffprobe_no_video_stream")
+
+        width = video_stream.get("width")
+        height = video_stream.get("height")
+
+        fps = _parse_fraction(
+            video_stream.get("avg_frame_rate") or ""
+        ) or _parse_fraction(video_stream.get("r_frame_rate") or "")
+
+        duration = None
+        if isinstance(fmt, dict):
+            duration = fmt.get("duration")
+        if duration is None:
+            duration = video_stream.get("duration")
+
+        try:
+            duration_f = float(duration) if duration is not None else None
+        except Exception:  # noqa: BLE001
+            duration_f = None
+
+        if width is None or height is None or fps is None or duration_f is None:
+            return ExtractorResult.failed("ffprobe_missing_required_fields")
+
+        resolution = f"{width}x{height}"
+
+        return ExtractorResult.success(
+            {
+                "duration": duration_f,
+                "fps": float(fps),
+                "resolution": resolution,
+                "width": int(width),
+                "height": int(height),
+            }
+        )
+
+
+================================================================================
+module2\extractors\frame_sampler.py
+================================================================================
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List
+
+from module2.context import ExtractionContext
+from module2.extractors.base import BaseExtractor, ExtractorResult
+from module2.logging_config import get_logger
+
+
+logger = get_logger("extractor.frame_sampler")
+
+
+async def _run_subprocess(cmd: List[str]) -> subprocess.CompletedProcess[str]:
+    return await asyncio.to_thread(
+        subprocess.run,
+        cmd,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+@dataclass(frozen=True)
+class FrameSamplerConfig:
+    ffmpeg_bin: str = "ffmpeg"
+    fps: float = 1.0
+    max_frames: int = 60
+    image_format: str = "jpg"
+
+
+class FrameSamplerExtractor(BaseExtractor):
+    """
+    PHASE 6: Sample frames using ffmpeg.
+
+    Writes frames under context.temp_dir and appends paths to context.sampled_frames.
+    """
+
+    def __init__(self, config: FrameSamplerConfig | None = None) -> None:
+        self._config = config or FrameSamplerConfig()
+
+    @property
+    def name(self) -> str:
+        return "frame_sampler"
+
+    @property
+    def dependencies(self) -> List[str]:
+        return ["video_probe"]
+
+    @property
+    def output_keys(self) -> List[str]:
+        return ["sampled_frames", "frame_count", "frame_dir"]
+
+    @property
+    def is_critical(self) -> bool:
+        return True
+
+    @property
+    def requires_gpu(self) -> bool:
+        return False
+
+    @property
+    def produces(self) -> set[str]:
+        return {"frames"}
+
+    @property
+    def requires(self) -> set[str]:
+        return {"probe"}
+
+    async def run(self, context: ExtractionContext) -> ExtractorResult:
+        if not context.video_path:
+            return ExtractorResult.failed("missing_video_path")
+
+        frames_dir = context.temp_path() / "frames"
+        frames_dir.mkdir(parents=True, exist_ok=True)
+
+        out_pattern = frames_dir / f"frame_%05d.{self._config.image_format}"
+
+        cmd = [
+            self._config.ffmpeg_bin,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            context.video_path,
+            "-vf",
+            f"fps={self._config.fps}",
+            "-frames:v",
+            str(self._config.max_frames),
+            str(out_pattern),
+        ]
+
+        try:
+            logger.debug(
+                "ffmpeg_sampling_started",
+                extra={"reel_id": context.reel_id},
+            )
+            await _run_subprocess(cmd)
+        except FileNotFoundError:
+            return ExtractorResult.failed("ffmpeg_not_found")
+        except subprocess.CalledProcessError as exc:
+            msg = (exc.stderr or exc.stdout or "").strip()
+            logger.error(
+                "ffmpeg_sampling_failure error=%s",
+                msg[:80],
+                extra={"reel_id": context.reel_id},
+            )
+            return ExtractorResult.failed(f"ffmpeg_failed:{msg}")
+        except Exception as exc:  # noqa: BLE001
+            return ExtractorResult.failed(f"ffmpeg_error:{exc}")
+
+        frame_paths = sorted(
+            str(p) for p in frames_dir.glob(f"*.{self._config.image_format}")
+        )
+        if not frame_paths:
+            return ExtractorResult.failed("no_frames_extracted")
+
+        # Critical requirement: append directly into context.sampled_frames for cleanup guarantee.
+        context.sampled_frames.extend(frame_paths)
+
+        return ExtractorResult.success(
+            {
+                "sampled_frames": frame_paths,
+                "frame_count": len(frame_paths),
+                "frame_dir": str(frames_dir),
+            }
+        )
+
+
+================================================================================
+module2\extractors\motion.py
+================================================================================
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional
+
+from module2.context import ExtractionContext
+from module2.extractors.base import BaseExtractor, ExtractorResult
+from module2.logging_config import get_logger
+
+
+logger = get_logger("extractor.motion")
+
+
+async def _run_subprocess(cmd: List[str]) -> subprocess.CompletedProcess[bytes]:
+    return await asyncio.to_thread(
+        subprocess.run,
+        cmd,
+        check=True,
+        capture_output=True,
+    )
+
+
+def _bytes_abs_diff_sum(a: bytes, b: bytes) -> int:
+    # Scaled-down frames make this cheap enough in pure Python.
+    return sum((x - y) if x >= y else (y - x) for x, y in zip(a, b, strict=False))
+
+
+@dataclass(frozen=True)
+class MotionConfig:
+    ffmpeg_bin: str = "ffmpeg"
+    downscale_width: int = 160
+    scene_change_threshold: float = 0.15
+
+
+class MotionExtractor(BaseExtractor):
+    """
+    PHASE 8: Motion extractor.
+
+    Computes:
+    - motion_score: mean normalized frame-diff energy across sampled frames
+    - scene_change_rate: scene_change_count / duration_seconds (fallback per-frame rate)
+    """
+
+    def __init__(self, config: MotionConfig | None = None) -> None:
+        self._config = config or MotionConfig()
+
+    @property
+    def name(self) -> str:
+        return "motion"
+
+    @property
+    def dependencies(self) -> List[str]:
+        return ["frame_sampler"]
+
+    @property
+    def output_keys(self) -> List[str]:
+        return ["motion_score", "scene_change_rate"]
+
+    @property
+    def is_critical(self) -> bool:
+        return True
+
+    @property
+    def requires_gpu(self) -> bool:
+        return False
+
+    @property
+    def produces(self) -> set[str]:
+        return {"motion_score", "scene_change_rate"}
+
+    @property
+    def requires(self) -> set[str]:
+        return {"frames"}
+
+    async def run(self, context: ExtractionContext) -> ExtractorResult:
+        if not context.sampled_frames:
+            return ExtractorResult.failed("missing_sampled_frames")
+
+        probe_entry = context.intermediate_outputs.get("video_probe")
+        if not isinstance(probe_entry, dict) or probe_entry.get("status") != "success":
+            return ExtractorResult.failed("missing_video_probe_features")
+
+        probe_features = probe_entry.get("features")
+        if not isinstance(probe_features, dict):
+            return ExtractorResult.failed("missing_video_probe_features")
+
+        in_w = probe_features.get("width")
+        in_h = probe_features.get("height")
+        duration = probe_features.get("duration")
+        if not isinstance(in_w, int) or not isinstance(in_h, int):
+            return ExtractorResult.failed("missing_resolution_for_motion")
+
+        # Maintain aspect ratio and keep even height.
+        out_w = max(2, int(self._config.downscale_width))
+        out_h = int(round(out_w * in_h / in_w))
+        if out_h % 2 == 1:
+            out_h += 1
+        out_h = max(2, out_h)
+
+        frames_dir = Path(context.sampled_frames[0]).parent
+        ext = Path(context.sampled_frames[0]).suffix.lstrip(".") or "jpg"
+        # Use sequential pattern matching frame_sampler's output naming.
+        # Avoids -pattern_type glob which is unsupported on Windows ffmpeg builds.
+        seq_pattern = str(frames_dir / f"frame_%05d.{ext}")
+
+        cmd = [
+            self._config.ffmpeg_bin,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            seq_pattern,
+            "-vf",
+            f"scale={out_w}:{out_h},format=gray",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "gray",
+            "-",
+        ]
+
+        try:
+            proc = await _run_subprocess(cmd)
+        except FileNotFoundError:
+            return ExtractorResult.failed("ffmpeg_not_found")
+        except subprocess.CalledProcessError as exc:
+            msg = (exc.stderr or exc.stdout or b"").decode(errors="ignore").strip()
+            return ExtractorResult.failed(f"ffmpeg_failed:{msg}")
+        except Exception as exc:  # noqa: BLE001
+            return ExtractorResult.failed(f"ffmpeg_error:{exc}")
+
+        raw = proc.stdout or b""
+        frame_size = out_w * out_h
+        if frame_size <= 0:
+            return ExtractorResult.failed("invalid_frame_size")
+
+        frame_count = len(raw) // frame_size
+        if frame_count < 2:
+            return ExtractorResult.failed("insufficient_frames_for_motion")
+
+        diffs: List[float] = []
+        prev = raw[0:frame_size]
+        for i in range(1, frame_count):
+            cur = raw[i * frame_size : (i + 1) * frame_size]
+            diff_sum = _bytes_abs_diff_sum(prev, cur)
+            diff_norm = diff_sum / (frame_size * 255.0)
+            diffs.append(float(diff_norm))
+            prev = cur
+
+        motion_score = sum(diffs) / len(diffs) if diffs else 0.0
+        scene_changes = sum(
+            1 for d in diffs if d >= self._config.scene_change_threshold
+        )
+
+        scene_change_rate: float
+        duration_f: Optional[float] = None
+        try:
+            duration_f = float(duration) if duration is not None else None
+        except Exception:  # noqa: BLE001
+            duration_f = None
+
+        if duration_f and duration_f > 0:
+            scene_change_rate = scene_changes / duration_f
+        else:
+            scene_change_rate = scene_changes / max(1, len(diffs))
+
+        return ExtractorResult.success(
+            {
+                "motion_score": float(motion_score),
+                "scene_change_rate": float(scene_change_rate),
+            }
+        )
+
+
+================================================================================
+module2\extractors\audio.py
+================================================================================
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List
+
+from module2.context import ExtractionContext
+from module2.extractors.base import BaseExtractor, ExtractorResult
+from module2.logging_config import get_logger
+
+
+logger = get_logger("extractor.audio")
+
+
+async def _run_subprocess(cmd: List[str]) -> subprocess.CompletedProcess[str]:
+    return await asyncio.to_thread(
+        subprocess.run,
+        cmd,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+@dataclass(frozen=True)
+class AudioConfig:
+    ffmpeg_bin: str = "ffmpeg"
+    sample_rate: int = 16000
+    channels: int = 1
+
+
+class AudioExtractor(BaseExtractor):
+    """
+    PHASE 10: Extract audio track from the downloaded video.
+
+    - Writes a temporary WAV file into context.temp_dir
+    - Sets context.audio_path for cleanup guarantee
+    """
+
+    def __init__(self, config: AudioConfig | None = None) -> None:
+        self._config = config or AudioConfig()
+
+    @property
+    def name(self) -> str:
+        return "audio"
+
+    @property
+    def dependencies(self) -> List[str]:
+        # Locked DAG places audio extraction after frame sampling stage.
+        return ["frame_sampler"]
+
+    @property
+    def output_keys(self) -> List[str]:
+        return ["audio_path"]
+
+    @property
+    def is_critical(self) -> bool:
+        return True
+
+    @property
+    def requires_gpu(self) -> bool:
+        return False
+
+    @property
+    def produces(self) -> set[str]:
+        return {"audio"}
+
+    @property
+    def requires(self) -> set[str]:
+        return {"frames"}
+
+    async def run(self, context: ExtractionContext) -> ExtractorResult:
+        if not context.video_path:
+            return ExtractorResult.failed("missing_video_path")
+
+        out_path = context.temp_path() / f"{context.reel_id}.wav"
+        cmd = [
+            self._config.ffmpeg_bin,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            context.video_path,
+            "-vn",
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            str(self._config.sample_rate),
+            "-ac",
+            str(self._config.channels),
+            str(out_path),
+        ]
+
+        try:
+            logger.debug(
+                "audio_extraction_started",
+                extra={"reel_id": context.reel_id},
+            )
+            await _run_subprocess(cmd)
+        except FileNotFoundError:
+            return ExtractorResult.failed("ffmpeg_not_found")
+        except subprocess.CalledProcessError as exc:
+            msg = (exc.stderr or exc.stdout or "").strip()
+            return ExtractorResult.failed(f"ffmpeg_failed:{msg}")
+        except Exception as exc:  # noqa: BLE001
+            return ExtractorResult.failed(f"ffmpeg_error:{exc}")
+
+        if not out_path.exists():
+            return ExtractorResult.failed("audio_extract_failed:missing_output_file")
+
+        context.audio_path = str(out_path)
+        return ExtractorResult.success({"audio_path": context.audio_path})
+
+
+================================================================================
+module2\extractors\ocr.py
+================================================================================
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+from dataclasses import dataclass
+from typing import List, Optional
+
+from module2.context import ExtractionContext
+from module2.extractors.base import BaseExtractor, ExtractorResult
+from module2.logging_config import get_logger
+
+
+logger = get_logger("extractor.ocr")
+
+
+def _dedupe_text(text: str) -> str:
+    """
+    Deduplicate aggregated OCR output by unique non-empty lines (stable order).
+    """
+    lines = [re.sub(r"\s+", " ", ln.strip()) for ln in text.splitlines()]
+    seen: set[str] = set()
+    out: List[str] = []
+    for ln in lines:
+        if not ln:
+            continue
+        if ln in seen:
+            continue
+        seen.add(ln)
+        out.append(ln)
+    return "\n".join(out).strip()
+
+
+@dataclass(frozen=True)
+class OcrConfig:
+    lang: str = "eng"
+
+
+class OcrExtractor(BaseExtractor):
+    """
+    PHASE 9: OCR extractor using pytesseract over sampled frames.
+
+    Returns:
+      - ocr_text: aggregated, deduplicated text across frames
+    """
+
+    def __init__(self, config: OcrConfig | None = None) -> None:
+        self._config = config or OcrConfig()
+
+    @property
+    def name(self) -> str:
+        return "ocr"
+
+    @property
+    def dependencies(self) -> List[str]:
+        return ["frame_sampler"]
+
+    @property
+    def output_keys(self) -> List[str]:
+        return ["ocr_text"]
+
+    @property
+    def is_critical(self) -> bool:
+        return False
+
+    @property
+    def requires_gpu(self) -> bool:
+        return False
+
+    @property
+    def produces(self) -> set[str]:
+        return {"ocr"}
+
+    @property
+    def requires(self) -> set[str]:
+        return {"frames"}
+
+    @property
+    def heavy(self) -> bool:
+        return True
+
+    async def run(self, context: ExtractionContext) -> ExtractorResult:
+        if not context.sampled_frames:
+            return ExtractorResult.skipped("no_sampled_frames")
+
+        try:
+            import pytesseract  # type: ignore
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "ocr_dependency_missing dep=pytesseract",
+                extra={"reel_id": context.reel_id},
+            )
+            return ExtractorResult.skipped("pytesseract_not_available")
+
+        try:
+            from PIL import Image  # type: ignore
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "ocr_dependency_missing dep=Pillow",
+                extra={"reel_id": context.reel_id},
+            )
+            return ExtractorResult.skipped("pillow_not_available")
+
+        logger.debug(
+            "tesseract_invoked frame_count=%d",
+            len(context.sampled_frames),
+            extra={"reel_id": context.reel_id},
+        )
+
+        aggregated: List[str] = []
+
+        for frame_path in context.sampled_frames:
+            try:
+                img = await asyncio.to_thread(Image.open, frame_path)
+                text = await asyncio.to_thread(
+                    pytesseract.image_to_string, img, lang=self._config.lang
+                )
+                if text:
+                    aggregated.append(text)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "ocr_frame_failure error=%s",
+                    str(exc)[:80],
+                    extra={"reel_id": context.reel_id},
+                )
+                continue
+
+        if not aggregated:
+            return ExtractorResult.success({"ocr_text": ""})
+
+        deduped = _dedupe_text("\n".join(aggregated))
+        return ExtractorResult.success({"ocr_text": deduped})
+
+
+================================================================================
+module2\extractors\hook.py
+================================================================================
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from typing import Any, Dict, List
+
+from module2.context import ExtractionContext
+from module2.extractors.base import BaseExtractor, ExtractorResult
+
+
+def _clean_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+@dataclass(frozen=True)
+class HookConfig:
+    """
+    Deterministic MVP thresholds (tunable later).
+    """
+
+    high_motion_threshold: float = 0.08
+    low_motion_threshold: float = 0.03
+    fast_scene_change_threshold: float = 0.5  # changes per second
+    ocr_min_chars: int = 15
+
+
+class HookExtractor(BaseExtractor):
+    """
+    PHASE 11: Hook heuristic extractor (deterministic MVP).
+
+    Uses:
+    - motion intermediate output (required)
+    - ocr intermediate output (optional)
+
+    Returns a combined list of hook signals and recommendations.
+    """
+
+    def __init__(self, config: HookConfig | None = None) -> None:
+        self._config = config or HookConfig()
+
+    @property
+    def name(self) -> str:
+        return "hook"
+
+    @property
+    def dependencies(self) -> List[str]:
+        # OCR is optional (Tier-2). We should not depend on it or we'd get skipped.
+        return ["motion"]
+
+    @property
+    def output_keys(self) -> List[str]:
+        return [
+            "hook_signals",
+            "hook_recommendations",
+            "hook_motion_score",
+            "hook_scene_change_rate",
+            "hook_ocr_present",
+        ]
+
+    @property
+    def is_critical(self) -> bool:
+        return True
+
+    @property
+    def requires_gpu(self) -> bool:
+        return False
+
+    @property
+    def produces(self) -> set[str]:
+        return {"hook_score", "hook_confidence", "hook_ocr_present"}
+
+    @property
+    def requires(self) -> set[str]:
+        return {"motion_score"}
+
+    @property
+    def optional_requires(self) -> set[str]:
+        return {"ocr"}
+
+    async def run(self, context: ExtractionContext) -> ExtractorResult:
+        motion_entry = context.intermediate_outputs.get("motion") or {}
+        motion_feats = (
+            motion_entry.get("features") if isinstance(motion_entry, dict) else None
+        )
+        if not isinstance(motion_feats, dict):
+            return ExtractorResult.failed("missing_motion_features")
+
+        motion_score = motion_feats.get("motion_score")
+        scene_change_rate = motion_feats.get("scene_change_rate")
+        if not isinstance(motion_score, (int, float)) or not isinstance(
+            scene_change_rate, (int, float)
+        ):
+            return ExtractorResult.failed("invalid_motion_features")
+
+        ocr_text = ""
+        ocr_entry = context.intermediate_outputs.get("ocr") or {}
+        if isinstance(ocr_entry, dict) and ocr_entry.get("status") == "success":
+            ocr_feats = ocr_entry.get("features")
+            if isinstance(ocr_feats, dict):
+                ocr_text = _clean_text(str(ocr_feats.get("ocr_text") or ""))
+
+        ocr_present = len(ocr_text) >= self._config.ocr_min_chars
+
+        signals: List[str] = []
+        recs: List[str] = []
+
+        # Motion-based hook signals
+        if motion_score >= self._config.high_motion_threshold:
+            signals.append("high_motion_energy")
+        elif motion_score <= self._config.low_motion_threshold:
+            signals.append("low_motion_energy")
+            recs.append(
+                "Add an early motion change (camera move, cut, gesture) in the first 1–2 seconds."
+            )
+        else:
+            signals.append("moderate_motion_energy")
+
+        if scene_change_rate >= self._config.fast_scene_change_threshold:
+            signals.append("fast_scene_changes")
+        else:
+            signals.append("slow_scene_changes")
+            recs.append(
+                "Consider 1 additional early cut to increase pacing in the hook window."
+            )
+
+        # OCR-based hook signals (optional)
+        if ocr_present:
+            signals.append("on_screen_text_present")
+        else:
+            signals.append("on_screen_text_absent_or_weak")
+            recs.append("Add 3–6 words of on-screen text stating the payoff or claim.")
+
+        # Keep deterministic and compact: dedupe recommendations while preserving order.
+        seen: set[str] = set()
+        recs_deduped: List[str] = []
+        for r in recs:
+            if r not in seen:
+                seen.add(r)
+                recs_deduped.append(r)
+
+        return ExtractorResult.success(
+            {
+                "hook_signals": signals,
+                "hook_recommendations": recs_deduped,
+                "hook_motion_score": float(motion_score),
+                "hook_scene_change_rate": float(scene_change_rate),
+                "hook_ocr_present": bool(ocr_present),
+            }
+        )
+
+
+================================================================================
+module2\extractors\llm_hook.py
+================================================================================
+
+import json
+import time
+from typing import List
+
+from .base import BaseExtractor, ExtractorResult
+
+from module2.logging_config import get_logger
+
+
+logger = get_logger("extractor.llm_hook")
+
+
+class LlmHookExtractor(BaseExtractor):
+
+    @property
+    def name(self) -> str:
+        return "llm_hook"
+
+    @property
+    def dependencies(self) -> List[str]:
+        return ["hook"]
+
+    @property
+    def is_critical(self) -> bool:
+        return False
+
+    @property
+    def output_keys(self) -> List[str]:
+        return [
+            "llm_hook_score",
+            "llm_hook_signals",
+            "llm_hook_reasoning",
+            "llm_hook_confidence",
+        ]
+
+    @property
+    def requires_gpu(self) -> bool:
+        return False
+
+    @property
+    def produces(self) -> set[str]:
+        return {"llm_hook_score", "llm_hook_confidence"}
+
+    @property
+    def requires(self) -> set[str]:
+        return {"hook_score"}
+
+    @property
+    def optional_requires(self) -> set[str]:
+        return {"ocr", "transcript"}
+
+    @property
+    def heavy(self) -> bool:
+        return True
+
+    async def run(self, context):
+
+        # ---------- Gather inputs ----------
+        metadata = context.metadata or {}
+        caption = metadata.get("caption") or ""
+        hashtags = " ".join(metadata.get("hashtags") or [])
+
+        ocr_entry = context.intermediate_outputs.get("ocr", {})
+        ocr_text = (ocr_entry.get("features") or {}).get("ocr_text", "")
+
+        transcript_entry = context.intermediate_outputs.get("transcript", {})
+        transcript_text = (transcript_entry.get("features") or {}).get("transcript", "")
+
+        hook_entry = context.intermediate_outputs.get("hook", {})
+        hook_features = hook_entry.get("features") or {}
+        hook_signals = hook_features.get("hook_signals") or []
+
+        # ---------- Lazy import LLM ----------
+        try:
+            from openai import OpenAI
+        except Exception:
+            return ExtractorResult.skipped("llm_not_available")
+
+        client = OpenAI()
+
+        # ---------- Prompt ----------
+        system_prompt = (
+            "You are a short-form video hook analyst. "
+            "Evaluate whether the first 3 seconds create curiosity, emotional pull, or value promise. "
+            "Return strict JSON only."
+        )
+
+        user_prompt = f"""
+[CAPTION]
+{caption}
+
+[HASHTAGS]
+{hashtags}
+
+[OCR]
+{ocr_text}
+
+[TRANSCRIPT]
+{transcript_text}
+
+[HEURISTIC SIGNALS]
+{hook_signals}
+"""
+
+        input_length = len(user_prompt)
+
+        # ---------- Call LLM ----------
+        logger.debug(
+            "llm_call_started input_length=%d",
+            input_length,
+            extra={"reel_id": context.reel_id},
+        )
+
+        t0 = time.monotonic()
+        try:
+            response = client.responses.create(
+                model="gpt-5-mini",
+                temperature=0,
+                max_output_tokens=300,
+                input=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+        except Exception as e:
+            elapsed = time.monotonic() - t0
+            logger.error(
+                "llm_call_failed error=%s duration_s=%.3f",
+                str(e)[:80],
+                elapsed,
+                extra={"reel_id": context.reel_id},
+            )
+            return ExtractorResult.failed(f"llm_error: {str(e)}")
+
+        elapsed = time.monotonic() - t0
+
+        # ---------- Parse response ----------
+        try:
+            text = response.output_text
+            data = json.loads(text)
+        except Exception:
+            logger.warning(
+                "llm_invalid_json output_length=%d duration_s=%.3f",
+                len(text) if text else 0,
+                elapsed,
+                extra={"reel_id": context.reel_id},
+            )
+            return ExtractorResult.failed("llm_invalid_json")
+
+        output_length = len(text) if text else 0
+        logger.debug(
+            "llm_response_received output_length=%d duration_s=%.3f",
+            output_length,
+            elapsed,
+            extra={"reel_id": context.reel_id},
+        )
+
+        # ---------- Validate ----------
+        hook_score = float(data.get("hook_score", 0.0))
+        signals = data.get("signals") or []
+        reasoning = data.get("reasoning") or ""
+        confidence = float(data.get("confidence", 0.0))
+
+        # ---------- Clamp ----------
+        hook_score = max(0.0, min(1.0, hook_score))
+        confidence = max(0.0, min(1.0, confidence))
+
+        # ---------- Return ----------
+        return ExtractorResult.success(
+            {
+                "llm_hook_score": hook_score,
+                "llm_hook_signals": signals,
+                "llm_hook_reasoning": reasoning,
+                "llm_hook_confidence": confidence,
+            }
+        )
+
+
+================================================================================
+module2\extractors\transcript.py
+================================================================================
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass
+from typing import List, Optional
+
+from module2.config import USE_REMOTE_INFERENCE
+from module2.context import ExtractionContext
+from module2.extractors.base import BaseExtractor, ExtractorResult
+from module2.logging_config import get_logger
+
+
+logger = get_logger("extractor.transcript")
+
+
+
+@dataclass(frozen=True)
+class TranscriptConfig:
+    language: Optional[str] = None
+
+
+class TranscriptExtractor(BaseExtractor):
+    """
+    Transcription extractor.
+
+    Remote mode only: reads transcript from cached Colab response.
+    No local model loading.
+    """
+
+    def __init__(self, config: TranscriptConfig | None = None) -> None:
+        self._config = config or TranscriptConfig()
+
+    @property
+    def name(self) -> str:
+        return "transcript"
+
+    @property
+    def dependencies(self) -> List[str]:
+        return ["video_fetcher"]
+
+    @property
+    def output_keys(self) -> List[str]:
+        return ["transcript", "transcript_confidence"]
+
+    @property
+    def is_critical(self) -> bool:
+        return False
+
+    @property
+    def requires_gpu(self) -> bool:
+        return False
+
+    @property
+    def produces(self) -> set[str]:
+        return {"transcript"}
+
+    @property
+    def requires(self) -> set[str]:
+        return {"video"}
+
+    @property
+    def heavy(self) -> bool:
+        return True
+
+    async def run(self, context: ExtractionContext) -> ExtractorResult:
+        if not USE_REMOTE_INFERENCE:
+            return ExtractorResult.failed("remote_inference_disabled")
+
+        return await self._run_remote(context)
+
+    async def _run_remote(self, context: ExtractionContext) -> ExtractorResult:
+        """Read transcript from cached remote inference result."""
+        from module2.remote_inference import call_remote_inference
+
+        video_url = (context.metadata or {}).get("reel_url", "")
+        if not video_url:
+            return ExtractorResult.failed("missing_video_url_for_remote")
+
+        result = await call_remote_inference(context, video_url)
+
+        if result is None or result.get("status") == "failed":
+            error = (result or {}).get("error", "remote_call_failed")
+            logger.warning(
+                "remote_inference_failed reason=%s",
+                str(error)[:120],
+                extra={"reel_id": context.reel_id},
+            )
+            return ExtractorResult.failed(f"remote_inference_failed:{str(error)[:80]}")
+
+        transcript = result.get("transcript", "")
+        confidence = result.get("transcript_confidence", 0.0)
+        inference_version = result.get("inference_version", "unknown")
+
+        logger.info(
+            "transcript_from_remote len=%d confidence=%.3f version=%s",
+            len(transcript),
+            confidence,
+            inference_version,
+            extra={"reel_id": context.reel_id},
+        )
+
+        return ExtractorResult.success(
+            {
+                "transcript": transcript,
+                "transcript_confidence": confidence,
+            }
+        )
+
+
+
+================================================================================
+module2\extractors\embedding.py
+================================================================================
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+from module2.config import USE_REMOTE_INFERENCE
+from module2.context import ExtractionContext
+from module2.extractors.base import BaseExtractor, ExtractorResult
+from module2.logging_config import get_logger
+
+
+logger = get_logger("extractor.embedding")
+
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+EMBEDDING_MODEL_VERSION = "1"
+EMBEDDING_VERSION = "v1_mvp_embedding"
+
+
+
+@dataclass(frozen=True)
+class EmbeddingConfig:
+    model_name: str = EMBEDDING_MODEL_NAME
+    model_version: str = EMBEDDING_MODEL_VERSION
+    embedding_version: str = EMBEDDING_VERSION
+
+
+class EmbeddingExtractor(BaseExtractor):
+    """
+    Text embedding extractor (384-dim MiniLM).
+
+    Remote mode only: reads text_embedding from cached Colab response.
+    No local sentence-transformers loading.
+    """
+
+    def __init__(self, config: EmbeddingConfig | None = None) -> None:
+        self._config = config or EmbeddingConfig()
+
+    @property
+    def name(self) -> str:
+        return "embedding"
+
+    @property
+    def dependencies(self) -> List[str]:
+        return []
+
+    @property
+    def output_keys(self) -> List[str]:
+        return [
+            "embedding",
+            "embedding_model_name",
+            "embedding_model_version",
+            "embedding_version",
+            "text_bundle_hash",
+        ]
+
+    @property
+    def is_critical(self) -> bool:
+        return False
+
+    @property
+    def requires_gpu(self) -> bool:
+        return False
+
+    @property
+    def produces(self) -> set[str]:
+        return {"embedding"}
+
+    @property
+    def optional_requires(self) -> set[str]:
+        return {"ocr", "transcript"}
+
+    @property
+    def heavy(self) -> bool:
+        return True
+
+    async def run(self, context: ExtractionContext) -> ExtractorResult:
+        if not USE_REMOTE_INFERENCE:
+            return ExtractorResult.failed("remote_inference_disabled")
+
+        return await self._run_remote(context)
+
+    async def _run_remote(self, context: ExtractionContext) -> ExtractorResult:
+        """Read text embedding from cached remote inference result."""
+        from module2.remote_inference import call_remote_inference
+
+        video_url = (context.metadata or {}).get("reel_url", "")
+        if not video_url:
+            return ExtractorResult.failed("missing_video_url_for_remote")
+
+        result = await call_remote_inference(context, video_url)
+
+        if result is None or result.get("status") == "failed":
+            error = (result or {}).get("error", "remote_call_failed")
+            logger.warning(
+                "remote_inference_failed reason=%s",
+                str(error)[:120],
+                extra={"reel_id": context.reel_id},
+            )
+            return ExtractorResult.failed(f"remote_inference_failed:{str(error)[:80]}")
+
+        text_embedding = result.get("text_embedding")
+        text_dim = result.get("text_dim", 0)
+        inference_version = result.get("inference_version", "unknown")
+
+        # Basic format validation only
+        if not isinstance(text_embedding, list):
+            return ExtractorResult.failed("invalid_embedding_format")
+
+        # Build deterministic hash from all text sources
+        caption = (context.metadata.get("caption") or "").strip()
+        hashtags = context.metadata.get("hashtags") or []
+        if isinstance(hashtags, list):
+            hashtags_txt = " ".join(
+                f"#{h}" for h in hashtags if isinstance(h, str) and h.strip()
+            )
+        else:
+            hashtags_txt = ""
+
+        ocr_txt = ""
+        ocr_entry = context.intermediate_outputs.get("ocr") or {}
+        if isinstance(ocr_entry, dict) and ocr_entry.get("status") == "success":
+            feats = ocr_entry.get("features")
+            if isinstance(feats, dict):
+                ocr_txt = str(feats.get("ocr_text") or "").strip()
+
+        transcript_entry = context.intermediate_outputs.get("transcript") or {}
+        transcript_feats = transcript_entry.get("features") or {}
+        transcript = transcript_feats.get("transcript", "")
+        
+        sections = [
+            "[CAPTION]",
+            caption,
+            "[HASHTAGS]",
+            hashtags_txt,
+            "[OCR]",
+            ocr_txt,
+            "[TRANSCRIPT]",
+            transcript,
+        ]
+        text_bundle = "\n".join(sections).strip()
+        bundle_hash = hashlib.sha256(text_bundle.encode("utf-8")).hexdigest()
+
+        logger.info(
+            "embedding_from_remote dim=%d hash=%s version=%s",
+            len(text_embedding),
+            bundle_hash[:12],
+            inference_version,
+            extra={"reel_id": context.reel_id},
+        )
+
+        return ExtractorResult.success(
+            {
+                "embedding": text_embedding,
+                "embedding_model_name": self._config.model_name,
+                "embedding_model_version": self._config.model_version,
+                "embedding_version": self._config.embedding_version,
+                "text_bundle_hash": bundle_hash,
+            }
+        )
+
+
+
+================================================================================
+module2\extractors\visual_embedding.py
+================================================================================
+
+"""
+Module 2 — Visual Embedding Extractor (CLIP ViT-L/14, 768-dim)
+----------------------------------------------------------------
+Reads clip_embedding from cached remote inference result.
+No local CLIP model loaded.
+"""
+
+from __future__ import annotations
+
+from typing import List
+
+from module2.config import USE_REMOTE_INFERENCE
+from module2.context import ExtractionContext
+from module2.extractors.base import BaseExtractor, ExtractorResult
+from module2.logging_config import get_logger
+
+
+logger = get_logger("extractor.visual_embedding")
+
+
+class VisualEmbeddingExtractor(BaseExtractor):
+    """
+    CLIP ViT-L/14 visual embedding (768-dim).
+
+    Remote mode only: reads clip_embedding from cached Colab response.
+    Validates dim == 768.
+    """
+
+    @property
+    def name(self) -> str:
+        return "visual_embedding"
+
+    @property
+    def dependencies(self) -> List[str]:
+        return []
+
+    @property
+    def output_keys(self) -> List[str]:
+        return ["clip_embedding"]
+
+    @property
+    def is_critical(self) -> bool:
+        return False
+
+    @property
+    def requires_gpu(self) -> bool:
+        return False
+
+    @property
+    def produces(self) -> set[str]:
+        return {"clip_embedding"}
+
+    @property
+    def optional_requires(self) -> set[str]:
+        return set()
+
+    @property
+    def heavy(self) -> bool:
+        return True
+
+    async def run(self, context: ExtractionContext) -> ExtractorResult:
+        if not USE_REMOTE_INFERENCE:
+            return ExtractorResult.skipped("visual_embedding_requires_remote")
+
+        from module2.remote_inference import call_remote_inference
+
+        video_url = (context.metadata or {}).get("reel_url", "")
+        if not video_url:
+            return ExtractorResult.failed("missing_video_url_for_remote")
+
+        result = await call_remote_inference(context, video_url)
+
+        if result is None or result.get("status") == "failed":
+            error = (result or {}).get("error", "remote_call_failed")
+            logger.warning(
+                "remote_inference_failed reason=%s",
+                str(error)[:120],
+                extra={"reel_id": context.reel_id},
+            )
+            return ExtractorResult.failed(f"remote_inference_failed:{str(error)[:80]}")
+
+        clip_embedding = result.get("clip_embedding")
+        clip_dim = result.get("clip_dim", 0)
+        inference_version = result.get("inference_version", "unknown")
+
+        # Basic format validation only
+        if not isinstance(clip_embedding, list):
+            return ExtractorResult.failed("invalid_clip_embedding_format")
+
+        logger.info(
+            "clip_embedding_from_remote dim=%d version=%s",
+            len(clip_embedding),
+            inference_version,
+            extra={"reel_id": context.reel_id},
+        )
+
+        return ExtractorResult.success(
+            {
+                "clip_embedding": clip_embedding,
+                "clip_model_name": "openai/CLIP-ViT-L-14",
+                "clip_dim": 768,
+            }
+        )
+
+
+================================================================================
+module2\projections\engine.py
+================================================================================
+
+from __future__ import annotations
+
+from typing import Any, Dict
+
+from module2.context import ExtractionContext
+from module2.logging_config import get_logger
+
+
+PROJECTION_VERSION = "v1"
+VECTOR_VERSION = "v1_embedding_miniLM_384"
+
+REQUIRED_PROJECTION_FEATURES: set[str] = {
+    "hook_score",
+    "motion_score",
+}
+
+OPTIONAL_PROJECTION_FEATURES: set[str] = {
+    "llm_hook_score",
+    "llm_hook_confidence",
+    "embedding",
+}
+
+logger = get_logger("projection")
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def compute_projections(context: ExtractionContext) -> None:
+    """
+    Phase 12: compute-only projection engine.
+
+    - Reads canonical signals from motion + hook intermediate outputs.
+    - Computes hook_score, pacing_score, trend_score, confidence.
+    - Never fails on missing inputs; reduces confidence accordingly.
+    - Writes results into context.intermediate_outputs["projections"].
+    """
+    rid = context.reel_id
+
+    motion_entry: Dict[str, Any] = context.intermediate_outputs.get("motion") or {}
+    motion_feats = (
+        motion_entry.get("features") if isinstance(motion_entry, dict) else None
+    )
+    if not isinstance(motion_feats, dict):
+        motion_feats = {}
+
+    hook_entry: Dict[str, Any] = context.intermediate_outputs.get("hook") or {}
+    hook_feats = hook_entry.get("features") if isinstance(hook_entry, dict) else None
+    if not isinstance(hook_feats, dict):
+        hook_feats = {}
+
+    motion_score = motion_feats.get("motion_score")
+    scene_change_rate = motion_feats.get("scene_change_rate")
+    hook_ocr_present = hook_feats.get("hook_ocr_present")
+
+    logger.debug(
+        "heuristic_signals motion_score=%s scene_change_rate=%s ocr_flag=%s",
+        motion_score,
+        scene_change_rate,
+        hook_ocr_present,
+        extra={"reel_id": rid},
+    )
+
+    # Presence tracking for confidence.
+    present_required = 0
+    present_optional = 0
+
+    if isinstance(motion_score, (int, float)):
+        present_required += 1
+        m_norm = _clamp01(motion_score / 0.12)
+    else:
+        m_norm = 0.0
+
+    if isinstance(scene_change_rate, (int, float)):
+        present_required += 1
+        s_norm = _clamp01(scene_change_rate / 0.7)
+    else:
+        s_norm = 0.0
+
+    t_flag = bool(hook_ocr_present) if isinstance(hook_ocr_present, bool) else False
+    if isinstance(hook_ocr_present, bool):
+        present_optional += 1
+    t_norm = 1.0 if t_flag else 0.0
+
+    # Hook projection.
+    hook_score = 0.5 * m_norm + 0.3 * s_norm + 0.2 * t_norm
+    hook_score = _clamp01(hook_score)
+
+    # LLM hook blending (Phase 14).
+    llm_entry = context.intermediate_outputs.get("llm_hook")
+    llm_features = (llm_entry or {}).get("features") or {}
+
+    llm_hook_score = llm_features.get("llm_hook_score")
+    llm_conf_raw = llm_features.get("llm_hook_confidence")
+
+    if isinstance(llm_hook_score, (int, float)):
+        L = max(0.0, min(1.0, float(llm_hook_score)))
+
+        logger.debug(
+            "llm_signals llm_hook_score=%.4f llm_confidence_raw=%s",
+            L,
+            llm_conf_raw,
+            extra={"reel_id": rid},
+        )
+
+        # ---------- coverage confidence ----------
+        metadata = context.metadata or {}
+        caption = metadata.get("caption") or ""
+
+        ocr_entry = context.intermediate_outputs.get("ocr")
+        ocr_text = ((ocr_entry or {}).get("features") or {}).get("ocr_text", "")
+
+        transcript_entry = context.intermediate_outputs.get("transcript")
+        transcript_text = ((transcript_entry or {}).get("features") or {}).get(
+            "transcript", ""
+        )
+
+        text_len = len(caption) + len(ocr_text) + len(transcript_text)
+        coverage = max(0.0, min(1.0, text_len / 400.0))
+
+        # ---------- agreement confidence ----------
+        agreement = 1.0 - abs(hook_score - L)
+        agreement = max(0.0, min(1.0, agreement))
+
+        # ---------- calibrated confidence ----------
+        if isinstance(llm_conf_raw, (int, float)):
+            C_llm = max(0.0, min(1.0, float(llm_conf_raw)))
+        else:
+            C_llm = 0.5
+
+        C = 0.5 * C_llm + 0.3 * coverage + 0.2 * agreement
+        C = max(0.0, min(1.0, C))
+
+        logger.debug(
+            "calibrated_confidence coverage=%.4f agreement=%.4f final_confidence=%.4f",
+            coverage,
+            agreement,
+            C,
+            extra={"reel_id": rid},
+        )
+
+        # ---------- dynamic weights ----------
+        w_L = 0.4 + 0.4 * C
+        w_H = 1.0 - w_L
+
+        logger.debug(
+            "fusion_weights w_H=%.4f w_L=%.4f",
+            w_H,
+            w_L,
+            extra={"reel_id": rid},
+        )
+
+        hook_score = w_H * hook_score + w_L * L
+        hook_score = max(0.0, min(1.0, hook_score))
+
+    # Pacing projection.
+    pacing_score = 0.7 * s_norm + 0.3 * m_norm
+    pacing_score = _clamp01(pacing_score)
+
+    # Trend placeholder.
+    trend_score = s_norm
+
+    # Confidence calculation.
+    required_count = 2  # motion_score, scene_change_rate
+    optional_count = 1  # hook_ocr_present
+    numerator = present_required + 0.5 * present_optional
+    denominator = required_count + 0.5 * optional_count
+    confidence = _clamp01(numerator / denominator) if denominator > 0 else 0.0
+
+    logger.debug(
+        "final_scores hook=%.4f pacing=%.4f trend=%.4f confidence=%.4f",
+        hook_score,
+        pacing_score,
+        trend_score,
+        confidence,
+        extra={"reel_id": rid},
+    )
+
+    context.intermediate_outputs["projections"] = {
+        "status": "success",
+        "features": {
+            "hook_score": hook_score,
+            "pacing_score": pacing_score,
+            "trend_score": trend_score,
+            "confidence": confidence,
+            "projection_version": PROJECTION_VERSION,
+        },
+        "error": None,
+    }
+
+
+================================================================================
+module2\projections\neighbor_similarity.py
+================================================================================
+
+from sqlalchemy import text
+
+from module2.logging_config import get_logger
+
+
+logger = get_logger("projection.neighbor")
+
+MIN_NEIGHBOR_POOL = 1000
+
+
+def fetch_embedding_neighbors(session, reel_id, embedding_vector, k=5):
+    """
+    Retrieve k nearest neighbors using pgvector cosine similarity.
+    Returns list of dicts with similarity and engagement metrics.
+
+    Cold-start safe: returns [] if embedding pool < MIN_NEIGHBOR_POOL.
+    """
+
+    if embedding_vector is None:
+        return []
+
+    # Cold-start guard: skip if insufficient embedding pool
+    try:
+        count_result = session.execute(text("SELECT COUNT(*) FROM reel_embeddings"))
+        pool_size = count_result.scalar() or 0
+    except Exception:  # noqa: BLE001
+        pool_size = 0
+
+    if pool_size < MIN_NEIGHBOR_POOL:
+        logger.info(
+            "similarity_skipped_cold_start pool_size=%d min_required=%d",
+            pool_size,
+            MIN_NEIGHBOR_POOL,
+            extra={"reel_id": reel_id},
+        )
+        return []
+
+    logger.debug(
+        "neighbor_query_started k=%d pool_size=%d",
+        k,
+        pool_size,
+        extra={"reel_id": reel_id},
+    )
+
+    try:
+        query = text(
+            """
+            SELECT
+                r.id,
+                1 - (e.embedding <=> :embedding) AS similarity,
+                r.views,
+                r.likes,
+                r.comments
+            FROM reel_embeddings e
+            JOIN reels r ON r.id = e.reel_id
+            WHERE r.id != :reel_id
+            ORDER BY e.embedding <=> :embedding
+            LIMIT :k
+            """
+        )
+
+        result = session.execute(
+            query,
+            {
+                "embedding": embedding_vector,
+                "reel_id": reel_id,
+                "k": k,
+            },
+        )
+
+        neighbors = []
+        for row in result:
+            neighbors.append(
+                {
+                    "similarity": float(row.similarity or 0.0),
+                    "views": row.views or 0,
+                    "likes": row.likes or 0,
+                    "comments": row.comments or 0,
+                }
+            )
+
+        avg_sim = (
+            sum(n["similarity"] for n in neighbors) / len(neighbors)
+            if neighbors
+            else 0.0
+        )
+        logger.debug(
+            "neighbor_count=%d avg_similarity=%.4f",
+            len(neighbors),
+            avg_sim,
+            extra={"reel_id": reel_id},
+        )
+
+        return neighbors
+
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "similarity_query_failed error=%s",
+            str(exc)[:80],
+            extra={"reel_id": reel_id},
+        )
+        # failure isolated — trend intelligence optional
+        return []
+
+
+================================================================================
+module2\worker.py
+================================================================================
+
+from __future__ import annotations
+
+import asyncio
+import os
+import time
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Protocol
+
+from sqlalchemy import text as sa_text
+from sqlalchemy.orm import Session
+
+from module2.extractors.base import ExtractorResult
+from module2.cleanup import cleanup_context
+from module2.context import ExtractionContext
+from module2.job_fetcher import claim_next_reel, peek_next_reel_id
+from module2.logging_config import get_logger
+from module2.persistence import persist_from_context
+from module2.planner import plan_adaptive_extractors, plan_baseline_extractors
+from module2.projections.engine import PROJECTION_VERSION, compute_projections
+
+from db.module2_models import ReelProjections
+
+
+logger = get_logger("worker")
+
+# ── Cooldown ──
+_recent_skip_cache: dict[str, float] = {}
+_SKIP_COOLDOWN_SECONDS = 30
+
+# ── Runtime guards (Step 3-4) ──
+_MAX_PROCESSING_SECONDS = 240
+_MAX_VIDEO_FILE_MB = 500
+
+# ── Projection version freeze (Step 5) ──
+_LOCKED_PROJECTION_VERSION = PROJECTION_VERSION
+
+# ── Periodic metrics (Step 6) ──
+_METRICS_INTERVAL = 100
+_metrics: dict[str, Any] = {
+    "total_processed": 0,
+    "total_failed": 0,
+    "total_skipped": 0,
+    "total_timeouts": 0,
+    "total_heavy_activated": 0,
+    "total_runtime_s": 0.0,
+}
+
+
+class ExtractorLike(Protocol):
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def dependencies(self) -> List[str]: ...
+
+    @property
+    def output_keys(self) -> List[str]: ...
+
+    @property
+    def is_critical(self) -> bool: ...
+
+    @property
+    def requires_gpu(self) -> bool: ...
+
+    async def run(self, context: ExtractionContext) -> ExtractorResult: ...
+
+
+async def _run_extractor(
+    extractor: ExtractorLike, context: ExtractionContext
+) -> ExtractorResult:
+    try:
+        # Use auto-logging wrapper if available (BaseExtractor subclasses).
+        runner = getattr(extractor, "run_with_logging", None) or extractor.run
+        result = await runner(context)
+        return result
+    except Exception as exc:  # noqa: BLE001
+        return ExtractorResult.failed(str(exc))
+
+
+async def execute_extractor_dag(
+    context: ExtractionContext,
+    extractors: Iterable[ExtractorLike],
+) -> Dict[str, ExtractorResult]:
+    """
+    Custom async DAG executor:
+    - respects declared dependencies
+    - runs independent extractors concurrently via asyncio.gather
+    - critical failure stops execution
+    - optional failure is isolated (logged, pipeline continues)
+    """
+    rid = context.reel_id
+    by_name: Dict[str, ExtractorLike] = {e.name: e for e in extractors}
+    pending = set(by_name.keys())
+    results: Dict[str, ExtractorResult] = {}
+
+    logger.info("dag_started", extra={"reel_id": rid})
+
+    while pending:
+        ready: List[str] = []
+        for name in list(pending):
+            deps = by_name[name].dependencies or []
+            if all(dep in results for dep in deps):
+                ready.append(name)
+
+        if not ready:
+            # Dependency cycle or missing dependency declarations.
+            raise RuntimeError(
+                f"DAG resolution stalled; pending={sorted(pending)} results={sorted(results)}"
+            )
+
+        # If any dependency failed/skipped, dependent is skipped.
+        runnable: List[str] = []
+        for name in ready:
+            deps = by_name[name].dependencies or []
+            dep_statuses = [results[d].status for d in deps]
+            if any(s != "success" for s in dep_statuses):
+                results[name] = ExtractorResult(
+                    status="skipped",
+                    features={},
+                    error="dependency_failed",
+                )
+                context.intermediate_outputs[name] = {
+                    "status": results[name].status,
+                    "features": results[name].features,
+                    "error": results[name].error,
+                }
+                pending.remove(name)
+            else:
+                runnable.append(name)
+
+        tasks = [_run_extractor(by_name[name], context) for name in runnable]
+        task_results = await asyncio.gather(*tasks)
+
+        for name, res in zip(runnable, task_results, strict=False):
+            results[name] = res
+            pending.remove(name)
+            if res.status == "success":
+                # Merge feature dict into intermediate outputs for downstream use.
+                context.intermediate_outputs[name] = {
+                    "status": res.status,
+                    "features": dict(res.features or {}),
+                    "error": res.error,
+                }
+            else:
+                context.intermediate_outputs[name] = {
+                    "status": res.status,
+                    "features": {},
+                    "error": res.error,
+                }
+
+            if res.status == "failed":
+                if by_name[name].is_critical:
+                    logger.error(
+                        "critical_extractor_failed extractor=%s error=%s",
+                        name,
+                        res.error,
+                        extra={"reel_id": rid},
+                    )
+                    raise RuntimeError(
+                        f"Critical extractor failed: {name}: {res.error}"
+                    )
+                logger.warning(
+                    "optional_extractor_failed extractor=%s error=%s",
+                    name,
+                    res.error,
+                    extra={"reel_id": rid},
+                )
+
+    return results
+
+
+async def run_once(
+    session: Session,
+    extractors: Iterable[ExtractorLike] | None = None,
+) -> Optional[str]:
+    """
+    Phase-2 worker skeleton:
+    - claims one ready_for_processing reel (row lock)
+    - logs processing/completed/failed/retry (no DB lifecycle persistence)
+    - executes DAG engine (extractors may be empty at this phase)
+    - always cleans up ephemeral artifacts
+    - 240s hard timeout (Step 3)
+    - 500MB video size guard (Step 4)
+
+    Returns processed reel_id, or None if no job available.
+    """
+    # Step 5: projection version freeze — fail fast on mismatch
+    if PROJECTION_VERSION != _LOCKED_PROJECTION_VERSION:
+        logger.critical(
+            "projection_version_mismatch locked=%s current=%s",
+            _LOCKED_PROJECTION_VERSION,
+            PROJECTION_VERSION,
+        )
+        raise RuntimeError(
+            f"Projection version changed mid-run: "
+            f"{_LOCKED_PROJECTION_VERSION} -> {PROJECTION_VERSION}"
+        )
+    if extractors is None:
+        raise RuntimeError("Extractor registry must be provided to worker")
+
+    extractor_list = list(extractors)
+    if not extractor_list:
+        raise RuntimeError("Extractor registry is empty")
+
+    # Pre-claim cooldown: peek candidate without locking.
+    candidate_id = peek_next_reel_id(session)
+    if candidate_id is None:
+        return None
+
+    now = time.monotonic()
+    last_skip = _recent_skip_cache.get(candidate_id)
+    if last_skip and (now - last_skip) < _SKIP_COOLDOWN_SECONDS:
+        logger.debug("cooldown_skip_preclaim", extra={"reel_id": candidate_id})
+        return None
+
+    # Proceed with locking claim.
+    reel = claim_next_reel(session)
+    if reel is None:
+        return None
+
+    reel_id = str(reel.id)
+    job_start = time.monotonic()
+    logger.info("job_claimed", extra={"reel_id": reel_id})
+
+    # Skip if already processed with current projection version.
+    existing = session.get(ReelProjections, reel_id)
+    if existing:
+        if existing.projection_version == PROJECTION_VERSION:
+            logger.info("already_processed_skip", extra={"reel_id": reel_id})
+            _recent_skip_cache[reel_id] = time.monotonic()
+            _metrics["total_skipped"] += 1
+            return None
+        else:
+            # Step 8: re-run with different version
+            logger.info(
+                "reprocess_detected old_version=%s new_version=%s",
+                existing.projection_version,
+                PROJECTION_VERSION,
+                extra={"reel_id": reel_id},
+            )
+
+    metadata = {
+        "reel_url": reel.reel_url,
+        "thumbnail_url": reel.thumbnail_url,
+        "caption": reel.caption,
+        "hashtags": reel.hashtags,
+        "audio_name": reel.audio_name,
+        "views": reel.views,
+        "likes": reel.likes,
+        "comments": reel.comments,
+        "publish_time": reel.publish_time,
+        "creator_id": str(reel.creator_id),
+        "discovery_source": reel.discovery_source,
+        "account_id": "test_account",
+    }
+    context = ExtractionContext.create(reel_id=reel_id, metadata=metadata)
+
+    # Atomic transaction: wrap entire reel processing
+    with session.begin():
+        try:
+            logger.info("dag_started", extra={"reel_id": reel_id})
+
+            # Phase A: baseline extractors for required projection features.
+            baseline = plan_baseline_extractors(extractor_list)
+            logger.info(
+                "activation_plan_baseline extractors=%s",
+                [e.name for e in baseline],
+                extra={"reel_id": reel_id},
+            )
+
+            # Step 3: wrap DAG execution in hard timeout
+            async def _run_pipeline() -> None:
+                await execute_extractor_dag(context=context, extractors=baseline)
+
+                # Step 4: artifact size guard — check video file only
+                if context.video_path and os.path.isfile(context.video_path):
+                    size_mb = os.path.getsize(context.video_path) / (1024 * 1024)
+                    if size_mb > _MAX_VIDEO_FILE_MB:
+                        logger.warning(
+                            "video_size_exceeded size_mb=%.1f limit_mb=%d",
+                            size_mb,
+                            _MAX_VIDEO_FILE_MB,
+                            extra={"reel_id": reel_id},
+                        )
+                        raise RuntimeError(
+                            f"Video file too large: {size_mb:.0f}MB > {_MAX_VIDEO_FILE_MB}MB"
+                        )
+
+                # Phase B: adaptive heavy extractors based on heuristic signals.
+                adaptive = plan_adaptive_extractors(extractor_list, context)
+                # Fix 6: explicit dedup — never re-run baseline extractors
+                baseline_names = {e.name for e in baseline}
+                adaptive = [e for e in adaptive if e.name not in baseline_names]
+                if adaptive:
+                    _metrics["total_heavy_activated"] += 1
+                    await execute_extractor_dag(context=context, extractors=adaptive)
+
+            try:
+                await asyncio.wait_for(
+                    _run_pipeline(),
+                    timeout=_MAX_PROCESSING_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                _metrics["total_timeouts"] += 1
+                logger.error(
+                    "worker_timeout limit_s=%d",
+                    _MAX_PROCESSING_SECONDS,
+                    extra={"reel_id": reel_id},
+                )
+                # Mark as failed and let transaction rollback
+                reel.ingestion_status = "FAILED"
+                raise RuntimeError(f"Worker timeout after {_MAX_PROCESSING_SECONDS}s")
+
+            # PART 4: Prevent Partial Persistence Check
+            critical_extractors = ["video_fetcher", "video_probe", "frame_sampler", "embedding", "visual_embedding"]
+            failed_critical = []
+            
+            for extractor_name in critical_extractors:
+                output = context.intermediate_outputs.get(extractor_name)
+                if not output or output.get("status") != "success":
+                    failed_critical.append(extractor_name)
+            
+            if failed_critical:
+                logger.critical(
+                    "critical_extractors_failed failed=%s",
+                    failed_critical,
+                    extra={"reel_id": reel_id}
+                )
+                reel.ingestion_status = "FAILED"
+                raise RuntimeError(f"Critical extractors failed: {failed_critical}")
+
+            compute_projections(context)
+            logger.info("projections_computed", extra={"reel_id": reel_id})
+
+            persist_from_context(session, context=context)
+            logger.info("persistence_success", extra={"reel_id": reel_id})
+
+            # Update ingestion status on success
+            reel.ingestion_status = "COMPLETED"
+
+            elapsed = time.monotonic() - job_start
+            _metrics["total_processed"] += 1
+            _metrics["total_runtime_s"] += elapsed
+
+            # Step 6: periodic metrics
+            total = _metrics["total_processed"]
+            if total > 0 and total % _METRICS_INTERVAL == 0:
+                avg_rt = _metrics["total_runtime_s"] / total
+                logger.info(
+                    "worker_metrics",
+                    extra={
+                        "total_processed": total,
+                        "total_failed": _metrics["total_failed"],
+                        "total_skipped": _metrics["total_skipped"],
+                        "total_timeouts": _metrics["total_timeouts"],
+                        "avg_runtime_s": round(avg_rt, 2),
+                        "heavy_activation_rate": round(
+                            _metrics["total_heavy_activated"] / total, 3
+                        ),
+                        "failure_rate": round(_metrics["total_failed"] / total, 3),
+                    },
+                )
+
+            logger.info(
+                "job_completed duration_s=%.2f",
+                elapsed,
+                extra={"reel_id": reel_id},
+            )
+            return reel_id
+
+        except Exception as exc:  # noqa: BLE001
+            _metrics["total_failed"] += 1
+            logger.error(
+                "rollback_triggered error=%s",
+                exc,
+                extra={"reel_id": reel_id},
+                exc_info=True,
+            )
+            
+            # PART 6: Retry Cap Logic
+            reel.retries += 1
+            
+            # Check if remote inference failed
+            remote_failed = False
+            remote_output = context.intermediate_outputs.get("_remote_inference")
+            if remote_output and remote_output.get("status") == "failed":
+                remote_failed = True
+            
+            if remote_failed and reel.retries >= 3:
+                reel.ingestion_status = "FAILED"
+                logger.error(
+                    "max_retries_exceeded retries=%d reel_id=%s",
+                    reel.retries,
+                    reel_id,
+                    extra={"reel_id": reel_id}
+                )
+            elif remote_failed:
+                # Leave as READY_FOR_PROCESSING for retry
+                reel.ingestion_status = "READY_FOR_PROCESSING"
+                logger.warning(
+                    "remote_failure_will_retry retries=%d reel_id=%s",
+                    reel.retries,
+                    reel_id,
+                    extra={"reel_id": reel_id}
+                )
+            else:
+                # Non-remote failure - mark as FAILED immediately
+                reel.ingestion_status = "FAILED"
+            
+            raise
+
+    finally:
+        cleanup_context(context)
+        logger.info("cleanup_completed", extra={"reel_id": reel_id})
+
+
+async def run_forever(
+    session_factory,
+    extractors: Iterable[ExtractorLike] | None = None,
+    poll_interval_seconds: float = 1.0,
+) -> None:
+    """
+    Polling loop. Caller owns event loop and process lifecycle.
+
+    session_factory: callable returning a context manager yielding Session
+      e.g. db.connection.get_session
+    """
+    while True:
+        try:
+            with session_factory() as session:
+                job = await run_once(session=session, extractors=extractors)
+                if job is None:
+                    await asyncio.sleep(poll_interval_seconds)
+        except Exception:  # noqa: BLE001
+            logger.critical(
+                "unexpected_worker_crash",
+                exc_info=True,
+            )
+            await asyncio.sleep(poll_interval_seconds)
+
+
+def verify_dataset_schema(session_factory) -> None:
+    """
+    Step 7: Startup self-test — verify hardening columns exist.
+    Fail fast if schema is missing required columns.
+    """
+    try:
+        with session_factory() as session:
+            session.execute(
+                sa_text(
+                    "SELECT feature_coverage, extractor_failures "
+                    "FROM reel_projections LIMIT 1"
+                )
+            )
+    except Exception as exc:
+        logger.critical(
+            "dataset_schema_invalid error=%s",
+            str(exc)[:120],
+        )
+        raise RuntimeError(
+            "Dataset schema validation failed. "
+            "Run db/migrations/003_dataset_hardening.sql first."
+        ) from exc
+
+    logger.info("module2_dataset_readiness: OK")
+
+
+if __name__ == "__main__":
+    from dotenv import load_dotenv
+
+    load_dotenv()
+
+    from db.connection import get_session
+    from module2.extractors.registry import build_default_registry
+
+    # Step 5: log frozen projection version
+    logger.info(
+        "projection_version_locked: %s",
+        _LOCKED_PROJECTION_VERSION,
+    )
+
+    # Step 7: startup self-test
+    verify_dataset_schema(get_session)
+
+    registry = build_default_registry()
+    print(
+        f"Worker starting with {len(list(registry.all()))} extractors... (Ctrl+C to stop)"
+    )
+    asyncio.run(run_forever(session_factory=get_session, extractors=registry.all()))
+
+
+================================================================================
+module2\persistence.py
+================================================================================
+
+from __future__ import annotations
+
+import uuid
+from typing import Any, Dict, Mapping, Optional
+
+from sqlalchemy import func
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.orm import Session
+
+from db.module2_models import (
+    ReelAudioFeatures,
+    ReelEmbeddings,
+    ReelFeatures,
+    ReelProjections,
+    ReelTextFeatures,
+)
+from module2.context import ExtractionContext
+from module2.logging_config import get_logger
+
+
+logger = get_logger("persistence")
+
+
+def _uuid(reel_id: str) -> uuid.UUID:
+    return uuid.UUID(reel_id)
+
+
+def _coalesce_update(stmt, model_cls, columns: list[str]) -> dict:
+    """
+    Non-destructive upsert:
+      col = COALESCE(EXCLUDED.col, table.col)
+    """
+    set_map: dict = {}
+    for col in columns:
+        set_map[col] = func.coalesce(
+            getattr(stmt.excluded, col), getattr(model_cls, col)
+        )
+    # Only bump updated_at when at least one logical column is being updated.
+    if set_map:
+        set_map["updated_at"] = func.now()
+    return set_map
+
+
+def upsert_reel_features(
+    session: Session,
+    *,
+    reel_id: str,
+    features: Mapping[str, Any],
+    model_versions: Optional[Mapping[str, Any]] = None,
+) -> None:
+    values: Dict[str, Any] = {
+        "reel_id": _uuid(reel_id),
+        "duration": features.get("duration"),
+        "fps": features.get("fps"),
+        "resolution": features.get("resolution"),
+        "motion_score": features.get("motion_score"),
+        "frame_entropy": features.get("frame_entropy"),
+        "scene_change_rate": features.get("scene_change_rate"),
+        "object_tags": features.get("object_tags"),
+        "emotion_vector": features.get("emotion_vector"),
+        "ocr_text": features.get("ocr_text"),
+        "audio_energy": features.get("audio_energy"),
+        "speech_ratio": features.get("speech_ratio"),
+        "transcript": features.get("transcript"),
+        "hook_motion_score": features.get("hook_motion_score"),
+        "hook_scene_change_rate": features.get("hook_scene_change_rate"),
+        "hook_ocr_present": features.get("hook_ocr_present"),
+        "hook_signals": features.get("hook_signals"),
+        "hook_recommendations": features.get("hook_recommendations"),
+        "llm_hook_score": features.get("llm_hook_score"),
+        "llm_hook_signals": features.get("llm_hook_signals"),
+        "llm_hook_reasoning": features.get("llm_hook_reasoning"),
+        "llm_hook_confidence": features.get("llm_hook_confidence"),
+    }
+    if model_versions is not None:
+        values["model_versions"] = dict(model_versions)
+
+    stmt = insert(ReelFeatures).values(**values)
+    update_cols = [
+        "duration",
+        "fps",
+        "resolution",
+        "motion_score",
+        "frame_entropy",
+        "scene_change_rate",
+        "object_tags",
+        "emotion_vector",
+        "ocr_text",
+        "audio_energy",
+        "speech_ratio",
+        "transcript",
+        "hook_motion_score",
+        "hook_scene_change_rate",
+        "hook_ocr_present",
+        "hook_signals",
+        "hook_recommendations",
+        "llm_hook_score",
+        "llm_hook_signals",
+        "llm_hook_reasoning",
+        "llm_hook_confidence",
+    ]
+    if model_versions is not None:
+        update_cols.append("model_versions")
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[ReelFeatures.reel_id],
+        set_=_coalesce_update(stmt, ReelFeatures, update_cols),
+    )
+    session.execute(stmt)
+
+
+def upsert_reel_audio_features(
+    session: Session,
+    *,
+    reel_id: str,
+    features: Mapping[str, Any],
+    model_versions: Optional[Mapping[str, Any]] = None,
+) -> None:
+    # audio_name intentionally excluded (exists on Module-1 reels table).
+    values: Dict[str, Any] = {
+        "reel_id": _uuid(reel_id),
+        "tempo": features.get("tempo"),
+        "beat_strength": features.get("beat_strength"),
+        "speech_presence": features.get("speech_presence"),
+        "music_presence": features.get("music_presence"),
+    }
+    if model_versions is not None:
+        values["model_versions"] = dict(model_versions)
+
+    stmt = insert(ReelAudioFeatures).values(**values)
+    update_cols = [
+        "tempo",
+        "beat_strength",
+        "speech_presence",
+        "music_presence",
+    ]
+    if model_versions is not None:
+        update_cols.append("model_versions")
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[ReelAudioFeatures.reel_id],
+        set_=_coalesce_update(stmt, ReelAudioFeatures, update_cols),
+    )
+    session.execute(stmt)
+
+
+def upsert_reel_text_features(
+    session: Session,
+    *,
+    reel_id: str,
+    features: Mapping[str, Any],
+    model_versions: Optional[Mapping[str, Any]] = None,
+) -> None:
+    values: Dict[str, Any] = {
+        "reel_id": _uuid(reel_id),
+        "caption_keywords": features.get("caption_keywords"),
+        "ocr_keywords": features.get("ocr_keywords"),
+        "transcript_keywords": features.get("transcript_keywords"),
+        "sentiment": features.get("sentiment"),
+        "intent": features.get("intent"),
+    }
+    if model_versions is not None:
+        values["model_versions"] = dict(model_versions)
+
+    stmt = insert(ReelTextFeatures).values(**values)
+    update_cols = [
+        "caption_keywords",
+        "ocr_keywords",
+        "transcript_keywords",
+        "sentiment",
+        "intent",
+    ]
+    if model_versions is not None:
+        update_cols.append("model_versions")
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[ReelTextFeatures.reel_id],
+        set_=_coalesce_update(stmt, ReelTextFeatures, update_cols),
+    )
+    session.execute(stmt)
+
+
+def persist_from_context(
+    session: Session,
+    *,
+    context: ExtractionContext,
+    model_versions: Optional[Mapping[str, Any]] = None,
+) -> None:
+    """
+    Centralized persistence entrypoint.
+
+    - Non-destructive upsert: never overwrites existing values with NULL.
+    - No commit/rollback: caller controls transaction boundary.
+    """
+    features_flat: Dict[str, Any] = {}
+    for _, entry in (context.intermediate_outputs or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("status") != "success":
+            continue
+        feats = entry.get("features")
+        if isinstance(feats, dict):
+            features_flat.update(feats)
+
+    rid = context.reel_id
+
+    try:
+        upsert_reel_features(
+            session, reel_id=rid, features=features_flat, model_versions=model_versions
+        )
+        feature_keys_present = [k for k, v in features_flat.items() if v is not None]
+        logger.debug(
+            "feature_keys_persisted count=%d keys=%s",
+            len(feature_keys_present),
+            feature_keys_present,
+            extra={"reel_id": rid},
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "upsert_failure table=reel_features error=%s",
+            str(exc)[:80],
+            extra={"reel_id": rid},
+        )
+        raise
+
+    try:
+        upsert_reel_audio_features(
+            session, reel_id=rid, features=features_flat, model_versions=model_versions
+        )
+        upsert_reel_text_features(
+            session, reel_id=rid, features=features_flat, model_versions=model_versions
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "upsert_failure table=audio_or_text error=%s",
+            str(exc)[:80],
+            extra={"reel_id": rid},
+        )
+        raise
+
+    projections_entry = context.intermediate_outputs.get("projections") or {}
+    if (
+        isinstance(projections_entry, dict)
+        and projections_entry.get("status") == "success"
+    ):
+        proj_feats = projections_entry.get("features")
+        if isinstance(proj_feats, dict):
+            # Build feature_coverage: logical feature → produced (bool)
+            feature_coverage: dict[str, Any] = {}
+            for ext_name, entry in (context.intermediate_outputs or {}).items():
+                if ext_name == "projections" or ext_name.startswith("_"):
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                status = entry.get("status")
+                # True only if extractor ran and succeeded
+                feature_coverage[ext_name] = status == "success"
+
+            # Part 12: track remote inference version
+            if hasattr(context, 'model_versions') and "remote_inference" in context.model_versions:
+                feature_coverage["remote_inference_version"] = context.model_versions[
+                    "remote_inference"
+                ]
+
+            # Build extractor_failures: only failed (not skipped) extractors
+            extractor_failures: dict[str, str] = {}
+            for ext_name, entry in (context.intermediate_outputs or {}).items():
+                if ext_name == "projections" or ext_name.startswith("_"):
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("status") == "failed":
+                    extractor_failures[ext_name] = str(entry.get("error") or "unknown")[
+                        :200
+                    ]
+
+            values = {
+                "reel_id": _uuid(rid),
+                "hook_score": proj_feats.get("hook_score"),
+                "pacing_score": proj_feats.get("pacing_score"),
+                "trend_score": proj_feats.get("trend_score"),
+                "confidence": proj_feats.get("confidence"),
+                "projection_version": proj_feats.get("projection_version"),
+                "feature_coverage": feature_coverage,
+                "extractor_failures": extractor_failures,
+            }
+            stmt = insert(ReelProjections).values(**values)
+            # COALESCE for projection scores; FULL OVERWRITE for coverage/failures
+            coalesce_cols = [
+                "hook_score",
+                "pacing_score",
+                "trend_score",
+                "confidence",
+                "projection_version",
+            ]
+            set_map = _coalesce_update(stmt, ReelProjections, coalesce_cols)
+            # Full overwrite on re-run (not COALESCE)
+            set_map["feature_coverage"] = stmt.excluded.feature_coverage
+            set_map["extractor_failures"] = stmt.excluded.extractor_failures
+            stmt = stmt.on_conflict_do_update(
+                index_elements=[ReelProjections.reel_id],
+                set_=set_map,
+            )
+            session.execute(stmt)
+            logger.debug(
+                "projection_keys_persisted keys=%s coverage_count=%d failures=%s",
+                sorted(proj_feats.keys()),
+                sum(1 for v in feature_coverage.values() if v),
+                list(extractor_failures.keys()) or "none",
+                extra={"reel_id": rid},
+            )
+
+    # Upsert embeddings if present.
+    # Safety: only persist when the extractor provides all required metadata.
+    # No fallback constants — if any key is missing, skip entirely.
+    embedding_entry = context.intermediate_outputs.get("embedding") or {}
+    if isinstance(embedding_entry, dict) and embedding_entry.get("status") == "success":
+        emb_feats = embedding_entry.get("features")
+        if isinstance(emb_feats, dict):
+            emb_model_name = emb_feats.get("embedding_model_name")
+            emb_model_version = emb_feats.get("embedding_model_version")
+            emb_version = emb_feats.get("embedding_version")
+            emb_hash = emb_feats.get("text_bundle_hash")
+            emb_vector = emb_feats.get("embedding")
+
+            # All five fields are required for a valid embedding row.
+            if all(
+                v is not None
+                for v in (
+                    emb_model_name,
+                    emb_model_version,
+                    emb_version,
+                    emb_hash,
+                    emb_vector,
+                )
+            ):
+                # Read clip_embedding from visual_embedding extractor (if present)
+                clip_vector = None
+                ve_entry = context.intermediate_outputs.get("visual_embedding") or {}
+                if isinstance(ve_entry, dict) and ve_entry.get("status") == "success":
+                    ve_feats = ve_entry.get("features")
+                    if isinstance(ve_feats, dict):
+                        clip_vector = ve_feats.get("clip_embedding")
+
+                values = {
+                    "reel_id": _uuid(rid),
+                    "embedding": emb_vector,
+                    "model_name": emb_model_name,
+                    "model_version": emb_model_version,
+                    "embedding_version": emb_version,
+                    "text_bundle_hash": emb_hash,
+                }
+                if clip_vector is not None:
+                    values["clip_embedding"] = clip_vector
+
+                stmt = insert(ReelEmbeddings).values(**values)
+                update_cols = [
+                    "embedding",
+                    "model_name",
+                    "model_version",
+                    "embedding_version",
+                    "text_bundle_hash",
+                ]
+                set_map = _coalesce_update(stmt, ReelEmbeddings, update_cols)
+                # clip_embedding: full overwrite (always recomputed)
+                if clip_vector is not None:
+                    set_map["clip_embedding"] = stmt.excluded.clip_embedding
+
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=[ReelEmbeddings.reel_id],
+                    set_=set_map,
+                )
+                session.execute(stmt)
+                logger.debug(
+                    "embedding_persisted=True embedding_dim=%d clip_dim=%d",
+                    len(emb_vector) if isinstance(emb_vector, list) else 0,
+                    len(clip_vector) if isinstance(clip_vector, list) else 0,
+                    extra={"reel_id": rid},
+                )
+
+
+================================================================================
+db\module2_schema.sql
+================================================================================
+
+-- Module 2 tables (Feature Extraction pipeline)
+-- Constraints:
+-- - reel_id is PRIMARY KEY and FOREIGN KEY -> reels(id)
+-- - No raw video/audio/frames persisted here
+-- - model_versions JSONB tracks extractor/model versions per row
+
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE IF NOT EXISTS reel_features (
+    reel_id UUID PRIMARY KEY REFERENCES reels(id) ON DELETE CASCADE,
+
+    duration DOUBLE PRECISION,
+    fps DOUBLE PRECISION,
+    resolution VARCHAR(32),
+
+    motion_score DOUBLE PRECISION,
+    frame_entropy DOUBLE PRECISION,
+    scene_change_rate DOUBLE PRECISION,
+
+    object_tags TEXT[],
+    emotion_vector JSONB,
+
+    ocr_text TEXT,
+    audio_energy DOUBLE PRECISION,
+    speech_ratio DOUBLE PRECISION,
+    transcript TEXT,
+
+    hook_motion_score DOUBLE PRECISION,
+    hook_scene_change_rate DOUBLE PRECISION,
+    hook_ocr_present BOOLEAN,
+    hook_signals JSONB,
+    hook_recommendations JSONB,
+
+    llm_hook_score DOUBLE PRECISION,
+    llm_hook_signals JSONB,
+    llm_hook_reasoning TEXT,
+    llm_hook_confidence DOUBLE PRECISION,
+
+    model_versions JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS reel_audio_features (
+    reel_id UUID PRIMARY KEY REFERENCES reels(id) ON DELETE CASCADE,
+
+    tempo DOUBLE PRECISION,
+    beat_strength DOUBLE PRECISION,
+    speech_presence DOUBLE PRECISION,
+    music_presence DOUBLE PRECISION,
+
+    model_versions JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS reel_text_features (
+    reel_id UUID PRIMARY KEY REFERENCES reels(id) ON DELETE CASCADE,
+
+    caption_keywords TEXT[],
+    ocr_keywords TEXT[],
+    transcript_keywords TEXT[],
+    sentiment VARCHAR(64),
+    intent VARCHAR(64),
+
+    model_versions JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS reel_projections (
+    reel_id UUID PRIMARY KEY REFERENCES reels(id) ON DELETE CASCADE,
+
+    hook_score DOUBLE PRECISION,
+    pacing_score DOUBLE PRECISION,
+    trend_score DOUBLE PRECISION,
+    confidence DOUBLE PRECISION,
+    projection_version VARCHAR(64) NOT NULL DEFAULT 'v1_mvp',
+    feature_coverage JSONB NOT NULL DEFAULT '{}'::jsonb,
+    extractor_failures JSONB NOT NULL DEFAULT '{}'::jsonb,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS reel_embeddings (
+    reel_id UUID PRIMARY KEY REFERENCES reels(id) ON DELETE CASCADE,
+
+    embedding VECTOR(384) NOT NULL,
+    model_name VARCHAR(128) NOT NULL,
+    model_version VARCHAR(64) NOT NULL,
+    embedding_version VARCHAR(64) NOT NULL,
+    text_bundle_hash VARCHAR(64) NOT NULL,
+    clip_embedding VECTOR(768),
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS reel_embeddings_embedding_idx
+ON reel_embeddings
+USING ivfflat (embedding vector_cosine_ops)
+WITH (lists = 100);
+
+CREATE INDEX IF NOT EXISTS reel_embeddings_clip_idx
+ON reel_embeddings
+USING ivfflat (clip_embedding vector_cosine_ops)
+WITH (lists = 100);
+
+
+
+
+================================================================================
+db\module2_models.py
+================================================================================
+
+import uuid
+from datetime import datetime
+
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, String, Text, func, text
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
+from sqlalchemy.orm import Mapped, mapped_column
+from pgvector.sqlalchemy import Vector
+
+from db.base import Base
+
+
+class ReelFeatures(Base):
+    __tablename__ = "reel_features"
+
+    reel_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("reels.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+
+    duration: Mapped[float | None] = mapped_column(Float, nullable=True)
+    fps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    resolution: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    motion_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    frame_entropy: Mapped[float | None] = mapped_column(Float, nullable=True)
+    scene_change_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    object_tags: Mapped[list[str] | None] = mapped_column(ARRAY(String), nullable=True)
+    emotion_vector: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
+    ocr_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    audio_energy: Mapped[float | None] = mapped_column(Float, nullable=True)
+    speech_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+    transcript: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    hook_motion_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    hook_scene_change_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    hook_ocr_present: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    hook_signals: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    hook_recommendations: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+
+    llm_hook_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    llm_hook_signals: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    llm_hook_reasoning: Mapped[str | None] = mapped_column(Text, nullable=True)
+    llm_hook_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    model_versions: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class ReelAudioFeatures(Base):
+    __tablename__ = "reel_audio_features"
+
+    reel_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("reels.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+
+    tempo: Mapped[float | None] = mapped_column(Float, nullable=True)
+    beat_strength: Mapped[float | None] = mapped_column(Float, nullable=True)
+    speech_presence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    music_presence: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    model_versions: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class ReelTextFeatures(Base):
+    __tablename__ = "reel_text_features"
+
+    reel_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("reels.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+
+    caption_keywords: Mapped[list[str] | None] = mapped_column(
+        ARRAY(String), nullable=True
+    )
+    ocr_keywords: Mapped[list[str] | None] = mapped_column(ARRAY(String), nullable=True)
+    transcript_keywords: Mapped[list[str] | None] = mapped_column(
+        ARRAY(String), nullable=True
+    )
+
+    sentiment: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    intent: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    model_versions: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class ReelProjections(Base):
+    __tablename__ = "reel_projections"
+
+    reel_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("reels.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+
+    hook_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    pacing_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    trend_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    projection_version: Mapped[str] = mapped_column(
+        String(64), nullable=False, server_default="v1_mvp"
+    )
+    feature_coverage: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    extractor_failures: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class ReelEmbeddings(Base):
+    __tablename__ = "reel_embeddings"
+
+    reel_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("reels.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+
+    embedding: Mapped[list[float]] = mapped_column(Vector(384), nullable=False)
+    model_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    model_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    embedding_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    text_bundle_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    clip_embedding: Mapped[list[float] | None] = mapped_column(
+        Vector(768), nullable=True
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+================================================================================
+db\migrations\003_dataset_hardening.sql
+================================================================================
+
+-- Migration: Dataset hardening for 15K reel collection
+-- Safe for existing rows (ADD COLUMN IF NOT EXISTS + defaults)
+-- No table rewrite required
+
+ALTER TABLE reel_projections
+  ADD COLUMN IF NOT EXISTS feature_coverage JSONB NOT NULL DEFAULT '{}'::jsonb,
+  ADD COLUMN IF NOT EXISTS extractor_failures JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+
+================================================================================
+db\migrations\004_pgvector_hardening.sql
+================================================================================
+
+-- Migration: pgvector production hardening
+-- Safe for existing rows
+
+-- 1.1 Ensure pgvector extension
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- 1.2 Make embedding column NOT NULL (set empty vector for any existing NULLs first)
+UPDATE reel_embeddings
+SET embedding = ARRAY_FILL(0, ARRAY[384])::vector
+WHERE embedding IS NULL;
+
+ALTER TABLE reel_embeddings
+  ALTER COLUMN embedding SET NOT NULL;
+
+-- 1.3 Add IVFFLAT index (cosine similarity)
+CREATE INDEX IF NOT EXISTS reel_embeddings_embedding_idx
+ON reel_embeddings
+USING ivfflat (embedding vector_cosine_ops)
+WITH (lists = 100);
+
+
+================================================================================
+db\migrations\005_clip_embedding_addition.sql
+================================================================================
+
+-- Migration: Add CLIP ViT-L/14 visual embedding column (768-dim)
+-- Non-destructive: existing 384-dim text embedding column unchanged
+
+CREATE EXTENSION IF NOT EXISTS vector;
+
+ALTER TABLE reel_embeddings
+  ADD COLUMN IF NOT EXISTS clip_embedding VECTOR(768);
+
+CREATE INDEX IF NOT EXISTS reel_embeddings_clip_idx
+ON reel_embeddings
+USING ivfflat (clip_embedding vector_cosine_ops)
+WITH (lists = 100);
+
+
+================================================================================
+db\migrations\006_engagement_lifecycle.sql
+================================================================================
+
+-- Migration 006: Engagement Lifecycle Tracking
+-- ==========================================
+-- Adds engagement lifecycle management fields to reels table
+-- This supports dataset management logic for engagement stability tracking
+
+ALTER TABLE reels
+ADD COLUMN IF NOT EXISTS engagement_last_updated_at TIMESTAMP,
+ADD COLUMN IF NOT EXISTS engagement_fetch_attempts INT DEFAULT 0,
+ADD COLUMN IF NOT EXISTS engagement_status VARCHAR(20) DEFAULT 'missing',
+ADD COLUMN IF NOT EXISTS is_active_for_training BOOLEAN DEFAULT TRUE,
+ADD COLUMN IF NOT EXISTS stability_score FLOAT DEFAULT 0.0;
+
+-- Add index for performance on engagement queries
+CREATE INDEX IF NOT EXISTS idx_reels_engagement_status ON reels(engagement_status);
+CREATE INDEX IF NOT EXISTS idx_reels_engagement_last_updated ON reels(engagement_last_updated_at);
+CREATE INDEX IF NOT EXISTS idx_reels_active_for_training ON reels(is_active_for_training);
+
+
+================================================================================
+db\migrations\007_retry_cap.sql
+================================================================================
+
+-- Migration 007: Add Retry Cap for Worker Safety
+-- ==============================================
+-- Adds retry tracking to prevent infinite retries on failed reels
+
+ALTER TABLE reels
+ADD COLUMN IF NOT EXISTS retries INT DEFAULT 0;
+
+-- Add index for performance on retry queries
+CREATE INDEX IF NOT EXISTS idx_reels_retries ON reels(reels);
+
+
+================================================================================
+docs\engagement_lifecycle_system.md
+================================================================================
+
+# Engagement Lifecycle System Documentation
+
+## Overview
+
+The Engagement Lifecycle System is a dataset management layer that tracks the stability and suitability of reels for training based on their engagement metrics and age. This system ensures that only reels with stable engagement patterns are used for model training, improving dataset quality and model reliability.
+
+## Architecture
+
+### Components
+
+1. **Database Schema** (`db/migrations/006_engagement_lifecycle.sql`)
+2. **ORM Models** (`db/models.py` - Reel model extensions)
+3. **Stability Evaluator** (`module2/engagement_lifecycle.py`)
+4. **Refresh Job** (`module2/engagement_updater.py`)
+5. **Planner Integration** (`module2/planner.py`)
+
+### Data Flow
+
+```
+Reel Ingestion → Engagement Tracking → Stability Evaluation → Training Eligibility
+     ↓                ↓                    ↓                     ↓
+  Basic Data    Lifecycle Fields    Status Updates     Dataset Filtering
+```
+
+## Database Schema
+
+### New Fields Added to `reels` Table
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `engagement_last_updated_at` | TIMESTAMP | NULL | Last time engagement metrics were evaluated |
+| `engagement_fetch_attempts` | INT | 0 | Number of times engagement was attempted to be fetched |
+| `engagement_status` | VARCHAR(20) | 'missing' | Current stability status of the reel |
+| `is_active_for_training` | BOOLEAN | TRUE | Whether reel is eligible for training datasets |
+| `stability_score` | FLOAT | 0.0 | Numerical stability score (0.0-1.0) |
+
+### Performance Indexes
+
+- `idx_reels_engagement_status` - For filtering by status
+- `idx_reels_engagement_last_updated` - For time-based queries
+- `idx_reels_active_for_training` - For training dataset selection
+
+### Engagement Status Values
+
+| Status | Description | Training Eligible | Stability Score |
+|--------|-------------|-------------------|-----------------|
+| `missing` | No engagement data ever collected | ❌ No | 0.0 |
+| `unstable` | Engagement data exists but shows high volatility | ❌ No | 0.2-0.5 |
+| `stable` | Engagement data exists and shows consistent patterns | ✅ Yes | 1.0 |
+| `unavailable` | Engagement data cannot be fetched (private, deleted, etc.) | ❌ No | 0.0 |
+
+## Stability Evaluation Logic
+
+### Core Function: `evaluate_engagement_stability(reel)`
+
+The stability evaluator implements a rule-based system that determines reel suitability based on age and engagement data availability.
+
+#### Evaluation Rules
+
+1. **Missing Engagement Data**
+   - **Condition**: `views IS NULL OR likes IS NULL`
+   - **Action**: Set status to "missing", training=False, score=0.0
+   - **Rationale**: Without engagement metrics, cannot assess stability
+
+2. **Very Recent Reels** (< 3 days)
+   - **Condition**: `age_days < 3`
+   - **Action**: Set status to "unstable", training=False, score=0.2
+   - **Rationale**: Engagement patterns still developing, too volatile
+
+3. **Mature Reels** (≥ 5 days)
+   - **Condition**: `age_days >= 5`
+   - **Action**: Set status to "stable", training=True, score=1.0
+   - **Rationale**: Engagement patterns stabilized, reliable for training
+
+4. **Intermediate Age** (3-4 days)
+   - **Condition**: `3 <= age_days < 5`
+   - **Action**: Set status to "unstable", training=False, score=0.5
+   - **Rationale**: Transition period, not yet stable enough
+
+#### Age Calculation
+
+```python
+age_days = (datetime.utcnow() - reel.publish_time).days
+```
+
+#### Field Updates
+
+The evaluator updates all lifecycle fields atomically:
+
+```python
+reel.engagement_status = computed_status
+reel.is_active_for_training = training_eligibility
+reel.stability_score = computed_score
+reel.engagement_last_updated_at = datetime.utcnow()
+reel.engagement_fetch_attempts += 1
+```
+
+## Refresh Job System
+
+### Core Function: `refresh_engagement_metrics(session)`
+
+The refresh job periodically updates engagement metrics for all reels and evaluates their stability.
+
+#### Job Characteristics
+
+- **Scope**: Processes all reels in the database
+- **Transaction**: Single database transaction with commit/rollback
+- **Error Handling**: Individual reel errors don't stop batch processing
+- **Logging**: Comprehensive progress tracking and error reporting
+- **Performance**: Progress logging every 100 reels
+
+#### Execution Flow
+
+1. **Initialization**
+   - Start database session
+   - Query all reels
+   - Initialize counters
+
+2. **Batch Processing**
+   - For each reel:
+     - Update `engagement_last_updated_at`
+     - Increment `engagement_fetch_attempts`
+     - Call stability evaluator
+     - Handle individual errors gracefully
+
+3. **Completion**
+   - Commit all changes
+   - Log final statistics
+   - Rollback on critical errors
+
+#### Logging Structure
+
+```python
+# Job start
+logger.info("engagement_refresh_started")
+
+# Progress (every 100 reels)
+logger.debug("engagement_refresh_progress processed=%d")
+
+# Individual reel updates (from evaluator)
+logger.info("engagement_status_stable_mature reel_id=%s age_days=%d")
+
+# Job completion
+logger.info("engagement_refresh_completed total=%d updated=%d errors=%d")
+
+# Error handling
+logger.error("engagement_refresh_error reel_id=%s error=%s")
+```
+
+## Integration Points
+
+### Planner Integration
+
+The planner has been modified to ensure embeddings always run in baseline:
+
+```python
+_BASELINE_EXTRAS: set[str] = {"audio", "embedding", "clip_embedding"}
+```
+
+This ensures:
+- Complete multimodal dataset coverage
+- Consistent feature availability for stability evaluation
+- No adaptive activation dependencies
+
+### Transcript Extractor Dependencies
+
+Transcript extractor now depends on video instead of audio:
+
+```python
+@property
+def dependencies(self) -> List[str]:
+    return ["video_fetcher"]
+
+@property
+def requires(self) -> set[str]:
+    return {"video"}
+```
+
+This aligns with remote inference architecture where the Colab server downloads video directly.
+
+## Usage Examples
+
+### Basic Stability Evaluation
+
+```python
+from db.models import Reel
+from module2.engagement_lifecycle import evaluate_engagement_stability
+
+# Get a reel
+reel = session.query(Reel).first()
+
+# Evaluate stability
+evaluate_engagement_stability(reel)
+
+# Check results
+print(f"Status: {reel.engagement_status}")
+print(f"Training Eligible: {reel.is_active_for_training}")
+print(f"Stability Score: {reel.stability_score}")
+```
+
+### Batch Refresh Job
+
+```python
+from db.connection import get_session
+from module2.engagement_updater import refresh_engagement_metrics
+
+# Run refresh job
+with get_session() as session:
+    refresh_engagement_metrics(session)
+```
+
+### Query Training-Eligible Reels
+
+```python
+from db.models import Reel
+
+# Get stable reels for training
+stable_reels = session.query(Reel).filter(
+    Reel.engagement_status == 'stable',
+    Reel.is_active_for_training == True
+).all()
+
+print(f"Found {len(stable_reels)} training-eligible reels")
+```
+
+## Monitoring and Observability
+
+### Key Metrics to Monitor
+
+1. **Status Distribution**
+   - Percentage of reels in each engagement status
+   - Trends over time
+   - Bottlenecks in dataset preparation
+
+2. **Age Distribution**
+   - Reels by age categories
+   - Time to stability
+   - Fresh content velocity
+
+3. **Error Rates**
+   - Engagement fetch failures
+   - Evaluation errors
+   - System health indicators
+
+### Sample Queries
+
+```sql
+-- Status distribution
+SELECT 
+    engagement_status,
+    COUNT(*) as count,
+    AVG(stability_score) as avg_score
+FROM reels 
+GROUP BY engagement_status;
+
+-- Age vs Status correlation
+SELECT 
+    CASE 
+        WHEN AGE(NOW(), publish_time) < INTERVAL '3 days' THEN '0-3'
+        WHEN AGE(NOW(), publish_time) < INTERVAL '5 days' THEN '3-5'
+        ELSE '5+'
+    END as age_group,
+    engagement_status,
+    COUNT(*) as count
+FROM reels 
+GROUP BY age_group, engagement_status
+ORDER BY age_group, engagement_status;
+
+-- Training eligibility over time
+SELECT 
+    DATE_TRUNC('day', engagement_last_updated_at) as date,
+    SUM(CASE WHEN is_active_for_training THEN 1 ELSE 0 END) as eligible,
+    COUNT(*) as total
+FROM reels 
+WHERE engagement_last_updated_at IS NOT NULL
+GROUP BY DATE_TRUNC('day', engagement_last_updated_at)
+ORDER BY date;
+```
+
+## Configuration and Tuning
+
+### Stability Thresholds
+
+Current thresholds can be adjusted in `engagement_lifecycle.py`:
+
+```python
+# Age thresholds
+YOUNG_REEL_DAYS = 3      # Below this = unstable
+MATURE_REEL_DAYS = 5     # Above this = stable
+
+# Stability scores
+MISSING_SCORE = 0.0
+YOUNG_SCORE = 0.2
+INTERMEDIATE_SCORE = 0.5
+MATURE_SCORE = 1.0
+```
+
+### Refresh Frequency
+
+The refresh job should be scheduled based on:
+
+- **Content velocity**: How fast new content is added
+- **Engagement volatility**: How quickly metrics change
+- **Resource constraints**: Database load considerations
+
+Recommended frequencies:
+- **High-velocity feeds**: Every 1-2 hours
+- **Medium-velocity feeds**: Every 6-12 hours
+- **Low-velocity feeds**: Daily
+
+## Future Enhancements
+
+### Planned Improvements
+
+1. **Growth Rate Analysis**
+   - Calculate engagement velocity (likes/views per day)
+   - Detect viral patterns
+   - Predict future stability
+
+2. **Content Quality Scoring**
+   - Combine engagement with content features
+   - Multi-dimensional quality assessment
+   - Adaptive threshold tuning
+
+3. **Creator-Level Analysis**
+   - Track creator consistency
+   - Creator reputation scoring
+   - Cross-reel pattern detection
+
+4. **Automated Threshold Tuning**
+   - ML-based threshold optimization
+   - A/B testing framework
+   - Performance feedback loops
+
+### Extension Points
+
+The system is designed for easy extension:
+
+- **Custom evaluators**: Implement different stability algorithms
+- **Additional metrics**: Add new engagement dimensions
+- **Status transitions**: Define more granular status states
+- **Integration hooks**: Connect with external data sources
+
+## Troubleshooting
+
+### Common Issues
+
+1. **Stuck in "missing" status**
+   - Check engagement data ingestion
+   - Verify data pipeline connectivity
+   - Review fetch attempt counts
+
+2. **High error rates in refresh job**
+   - Check database connectivity
+   - Verify reel data integrity
+   - Review log files for patterns
+
+3. **Performance issues**
+   - Add database indexes
+   - Optimize batch sizes
+   - Consider parallel processing
+
+### Debugging Tools
+
+```python
+# Check reel status details
+reel = session.query(Reel).filter(Reel.id == reel_id).first()
+print(f"Status: {reel.engagement_status}")
+print(f"Last Updated: {reel.engagement_last_updated_at}")
+print(f"Fetch Attempts: {reel.engagement_fetch_attempts}")
+print(f"Age: {(datetime.utcnow() - reel.publish_time).days} days")
+
+# Manual stability evaluation
+from module2.engagement_lifecycle import evaluate_engagement_stability
+evaluate_engagement_stability(reel)
+session.commit()
+```
+
+## Conclusion
+
+The Engagement Lifecycle System provides a robust foundation for dataset quality management in the AI Reel Intelligence Engine. By systematically evaluating engagement stability and managing training eligibility, it ensures that models are trained on high-quality, reliable data while maintaining flexibility for future enhancements.
+
+The modular design allows for easy integration with existing systems and provides clear extension points for advanced features as the platform evolves.
+
+
+================================================================================
+colab_inference_server.py
+================================================================================
+
+"""
+Colab GPU Inference Server — Whisper-large + MiniLM-384 + CLIP ViT-L/14
+========================================================================
+Run in Google Colab with GPU runtime.
+
+Install:
+    !pip install fastapi uvicorn pyngrok torch torchvision torchaudio
+    !pip install openai-whisper sentence-transformers
+    !pip install git+https://github.com/openai/CLIP.git
+
+Start:
+    uvicorn colab_inference_server:app --host 0.0.0.0 --port 8000
+    # Then expose with ngrok
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import shutil
+import subprocess
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+import uvicorn
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s"
+)
+logger = logging.getLogger("colab_inference")
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+
+app = FastAPI(title="Module2 GPU Inference", version="1.0")
+
+INFERENCE_VERSION = "whisper_large_minilm_clip_v1"
+
+# ---------------------------------------------------------------------------
+# Model globals (loaded once at startup)
+# ---------------------------------------------------------------------------
+_whisper_model = None
+_minilm_model = None
+_clip_model = None
+_clip_preprocess = None
+_device = None
+
+
+@app.on_event("startup")
+def load_models() -> None:
+    global _whisper_model, _minilm_model, _clip_model, _clip_preprocess, _device
+
+    _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info("Device: %s", _device)
+
+    if torch.cuda.is_available():
+        mem = torch.cuda.get_device_properties(0).total_mem / (1024**3)
+        logger.info("GPU memory: %.1f GB", mem)
+
+    # Whisper-large
+    import whisper  # type: ignore
+
+    logger.info("Loading Whisper-large...")
+    _whisper_model = whisper.load_model("large", device=_device)
+    logger.info("Whisper-large loaded")
+
+    # MiniLM (sentence-transformers, 384-dim)
+    from sentence_transformers import SentenceTransformer  # type: ignore
+
+    logger.info("Loading MiniLM...")
+    _minilm_model = SentenceTransformer(
+        "sentence-transformers/all-MiniLM-L6-v2", device=str(_device)
+    )
+    logger.info("MiniLM loaded")
+
+    # CLIP ViT-L/14
+    import clip  # type: ignore
+
+    logger.info("Loading CLIP ViT-L/14...")
+    _clip_model, _clip_preprocess = clip.load("ViT-L/14", device=_device)
+    logger.info("CLIP ViT-L/14 loaded")
+
+
+# ---------------------------------------------------------------------------
+# Request / Response models
+# ---------------------------------------------------------------------------
+
+
+class ProcessRequest(BaseModel):
+    reel_id: str
+    video_url: str
+
+
+class ProcessResponse(BaseModel):
+    reel_id: str
+    transcript: str
+    transcript_confidence: float
+    text_embedding: list[float]
+    text_dim: int
+    clip_embedding: list[float]
+    clip_dim: int
+    audio_duration: float
+    processing_time: float
+    inference_version: str
+
+
+class ErrorResponse(BaseModel):
+    reel_id: str
+    error: str
+    inference_version: str
+
+
+# ---------------------------------------------------------------------------
+# Helper: download video
+# ---------------------------------------------------------------------------
+
+
+def _download_video(url: str, dest_dir: str) -> str:
+    """Download video to temp directory. Returns file path."""
+    video_path = os.path.join(dest_dir, "video.mp4")
+    # Use yt-dlp for robust downloading
+    try:
+        import yt_dlp  # type: ignore
+
+        ydl_opts = {
+            "outtmpl": video_path,
+            "format": "best[ext=mp4]/best",
+            "quiet": True,
+            "no_warnings": True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+    except Exception:
+        # Fallback: direct HTTP download
+        import urllib.request
+
+        urllib.request.urlretrieve(url, video_path)
+
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(f"Video download failed: {url}")
+    return video_path
+
+
+def _extract_audio(video_path: str, dest_dir: str) -> str:
+    """Extract audio to WAV using ffmpeg."""
+    audio_path = os.path.join(dest_dir, "audio.wav")
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-i",
+            video_path,
+            "-vn",
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            audio_path,
+            "-y",
+        ],
+        capture_output=True,
+        check=True,
+    )
+    return audio_path
+
+
+def _sample_frames(video_path: str, dest_dir: str, n_frames: int = 10) -> list[str]:
+    """Sample N uniform frames from video using ffmpeg."""
+    import cv2  # type: ignore
+
+    cap = cv2.VideoCapture(video_path)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total_frames <= 0:
+        cap.release()
+        return []
+
+    indices = np.linspace(0, total_frames - 1, n_frames, dtype=int)
+    frame_paths: list[str] = []
+
+    for i, idx in enumerate(indices):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+        ret, frame = cap.read()
+        if ret:
+            fp = os.path.join(dest_dir, f"frame_{i:03d}.jpg")
+            cv2.imwrite(fp, frame)
+            frame_paths.append(fp)
+
+    cap.release()
+    return frame_paths
+
+
+# ---------------------------------------------------------------------------
+# Endpoint
+# ---------------------------------------------------------------------------
+
+
+@app.post("/process_reel", response_model=ProcessResponse)
+def process_reel(req: ProcessRequest):
+    t0 = time.time()
+    logger.info("request_started reel_id=%s", req.reel_id)
+
+    tmp_dir = tempfile.mkdtemp(prefix=f"colab_{req.reel_id[:8]}_")
+
+    try:
+        # 1. Download video
+        video_path = _download_video(req.video_url, tmp_dir)
+
+        # 2. Extract audio
+        audio_path = _extract_audio(video_path, tmp_dir)
+
+        # 3. Whisper transcription
+        with torch.no_grad():
+            result = _whisper_model.transcribe(audio_path, language=None)
+
+        transcript = result.get("text", "").strip()
+        # Approximate confidence from avg log-prob of segments
+        segments = result.get("segments", [])
+        if segments:
+            avg_logprob = sum(s.get("avg_logprob", -1.0) for s in segments) / len(
+                segments
+            )
+            # Convert log-prob to approximate 0-1 confidence
+            transcript_confidence = round(min(1.0, max(0.0, 1.0 + avg_logprob)), 3)
+        else:
+            transcript_confidence = 0.0
+
+        audio_duration = result.get("duration", 0.0) or 0.0
+
+        # 4. MiniLM text embedding (384-dim)
+        with torch.no_grad():
+            text_emb = _minilm_model.encode(
+                transcript if transcript else "[EMPTY]",
+                normalize_embeddings=False,
+            )
+        text_embedding = [float(x) for x in text_emb.tolist()]
+
+        # 5. CLIP visual embedding (768-dim)
+        import clip  # type: ignore
+        from PIL import Image  # type: ignore
+
+        frame_paths = _sample_frames(video_path, tmp_dir, n_frames=10)
+
+        if frame_paths:
+            frame_tensors = []
+            for fp in frame_paths:
+                img = Image.open(fp).convert("RGB")
+                frame_tensors.append(_clip_preprocess(img))
+
+            batch = torch.stack(frame_tensors).to(_device)
+
+            with torch.no_grad():
+                frame_features = _clip_model.encode_image(batch)
+
+            # Mean pool across frames
+            clip_vec = frame_features.mean(dim=0).cpu().numpy()
+            clip_embedding = [float(x) for x in clip_vec.tolist()]
+        else:
+            # No frames — zero vector
+            clip_embedding = [0.0] * 768
+
+        elapsed = round(time.time() - t0, 2)
+        logger.info(
+            "request_success reel_id=%s duration=%.2fs transcript_len=%d",
+            req.reel_id,
+            elapsed,
+            len(transcript),
+        )
+
+        return ProcessResponse(
+            reel_id=req.reel_id,
+            transcript=transcript,
+            transcript_confidence=transcript_confidence,
+            text_embedding=text_embedding,
+            text_dim=len(text_embedding),
+            clip_embedding=clip_embedding,
+            clip_dim=len(clip_embedding),
+            audio_duration=round(audio_duration, 2),
+            processing_time=elapsed,
+            inference_version=INFERENCE_VERSION,
+        )
+
+    except Exception as exc:
+        elapsed = round(time.time() - t0, 2)
+        logger.error(
+            "request_failed reel_id=%s duration=%.2fs error=%s",
+            req.reel_id,
+            elapsed,
+            str(exc)[:200],
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "reel_id": req.reel_id,
+                "error": str(exc)[:200],
+                "inference_version": INFERENCE_VERSION,
+            },
+        )
+
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+

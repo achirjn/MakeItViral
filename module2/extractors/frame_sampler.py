@@ -63,6 +63,14 @@ class FrameSamplerExtractor(BaseExtractor):
     def requires_gpu(self) -> bool:
         return False
 
+    @property
+    def produces(self) -> set[str]:
+        return {"frames"}
+
+    @property
+    def requires(self) -> set[str]:
+        return {"probe"}
+
     async def run(self, context: ExtractionContext) -> ExtractorResult:
         if not context.video_path:
             return ExtractorResult.failed("missing_video_path")

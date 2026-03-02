@@ -7,6 +7,18 @@ from module2.logging_config import get_logger
 
 
 PROJECTION_VERSION = "v1"
+VECTOR_VERSION = "v1_embedding_miniLM_384"
+
+REQUIRED_PROJECTION_FEATURES: set[str] = {
+    "hook_score",
+    "motion_score",
+}
+
+OPTIONAL_PROJECTION_FEATURES: set[str] = {
+    "llm_hook_score",
+    "llm_hook_confidence",
+    "embedding",
+}
 
 logger = get_logger("projection")
 

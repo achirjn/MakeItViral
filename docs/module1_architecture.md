@@ -44,7 +44,7 @@ Stores metadata for a scraped Reel.
 - `has_engagement_metrics`: Boolean
 - `is_training_eligible`: Boolean
 - `metadata_completeness_score`: Float
-- `ingestion_status`: String (Default: 'pending')
+- `ingestion_status`: String (Default: 'PENDING')
 - `discovery_source`: String (Nullable)
 - `created_at`: DateTime
 
@@ -84,7 +84,7 @@ When the Ingestion Service processes a Reel whose `reel_url` already exists in t
 - A new `IngestionLog` entry with `status="success"` is recorded.
 
 ### 3. Ingestion Status (Behavior C)
-All successfully ingested Reels are inserted with `ingestion_status = "pending"`. Module 1 does **not** transition this status. A downstream orchestration module or worker will transition the status to `"ready_for_processing"` after verifying eligibility.
+All successfully ingested Reels are inserted with `ingestion_status = "PENDING"`. Module 1 does **not** transition this status. A downstream orchestration module or worker will transition the status to `"READY_FOR_PROCESSING"` after verifying eligibility.
 
 ## Discovery Strategy (Playwright)
 Discovery scripts (`trending.py`, `hashtag.py`, `keyword.py`, `creator.py`) are independent Playwright scripts.

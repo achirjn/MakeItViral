@@ -19,10 +19,20 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .base import Base
 
 
+# Engagement Status Values
+# =======================
+# engagement_status field values for lifecycle tracking:
+# - "missing": No engagement data ever collected
+# - "unstable": Engagement data exists but shows high volatility
+# - "stable": Engagement data exists and shows consistent patterns
+# - "unavailable": Engagement data cannot be fetched (private, deleted, etc.)
+
+
 class IngestionStatus(str, Enum):
-    PENDING = "pending"
-    READY_FOR_PROCESSING = "ready_for_processing"
-    FAILED = "failed"
+    PENDING = "PENDING"
+    READY_FOR_PROCESSING = "READY_FOR_PROCESSING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
 
 
 class IngestionLogStatus(str, Enum):
@@ -57,7 +67,7 @@ class Reel(Base):
     __table_args__ = (
         UniqueConstraint("reel_url", name="uq_reels_reel_url"),
         CheckConstraint(
-            "ingestion_status IN ('pending', 'ready_for_processing', 'failed')",
+            "ingestion_status IN ('PENDING', 'READY_FOR_PROCESSING', 'COMPLETED', 'FAILED')",
             name="ck_reels_ingestion_status_valid",
         ),
     )
@@ -97,6 +107,29 @@ class Reel(Base):
         default=IngestionStatus.PENDING.value,
     )
     discovery_source: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    
+    # Engagement lifecycle tracking fields
+    engagement_last_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    engagement_fetch_attempts: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0
+    )
+    engagement_status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="missing"
+    )
+    is_active_for_training: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True
+    )
+    stability_score: Mapped[float] = mapped_column(
+        nullable=False, default=0.0
+    )
+    
+    # Worker retry tracking
+    retries: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0
+    )
+    
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

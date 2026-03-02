@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from module2.config import USE_REMOTE_INFERENCE
 from module2.context import ExtractionContext
 from module2.extractors.base import BaseExtractor, ExtractorResult
 from module2.logging_config import get_logger
@@ -17,7 +17,6 @@ EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 EMBEDDING_MODEL_VERSION = "1"
 EMBEDDING_VERSION = "v1_mvp_embedding"
 
-_MODEL_CACHE = None
 
 
 @dataclass(frozen=True)
@@ -29,12 +28,10 @@ class EmbeddingConfig:
 
 class EmbeddingExtractor(BaseExtractor):
     """
-    PHASE 13: Multimodal text embedding extractor using sentence-transformers all-MiniLM-L6-v2 (384-dim).
+    Text embedding extractor (384-dim MiniLM).
 
-    - No DAG dependencies: runs whenever scheduled, reads whatever signals exist.
-    - Lazy-loads sentence-transformers at runtime (not import time).
-    - Singleton model prevents repeated loading across worker jobs.
-    - Skips encoding if text_bundle_hash is unchanged from a previous run.
+    Remote mode only: reads text_embedding from cached Colab response.
+    No local sentence-transformers loading.
     """
 
     def __init__(self, config: EmbeddingConfig | None = None) -> None:
@@ -46,9 +43,7 @@ class EmbeddingExtractor(BaseExtractor):
 
     @property
     def dependencies(self) -> List[str]:
-        # No dependencies: embedding runs independently and reads whatever
-        # intermediate outputs are available at execution time.
-        return []
+        return ["remote_inference"]
 
     @property
     def output_keys(self) -> List[str]:
@@ -68,8 +63,26 @@ class EmbeddingExtractor(BaseExtractor):
     def requires_gpu(self) -> bool:
         return False
 
+    @property
+    def produces(self) -> set[str]:
+        return {"embedding"}
+
+    @property
+    def optional_requires(self) -> set[str]:
+        return {"ocr", "transcript"}
+
+    @property
+    def heavy(self) -> bool:
+        return True
+
     async def run(self, context: ExtractionContext) -> ExtractorResult:
-        # --- Build text bundle from available signals ---
+        if not USE_REMOTE_INFERENCE:
+            return ExtractorResult.failed("remote_inference_disabled")
+
+        if not context.text_embedding:
+            return ExtractorResult.failed("missing_text_embedding")
+
+        # Build deterministic hash from all text sources
         caption = (context.metadata.get("caption") or "").strip()
         hashtags = context.metadata.get("hashtags") or []
         if isinstance(hashtags, list):
@@ -86,13 +99,10 @@ class EmbeddingExtractor(BaseExtractor):
             if isinstance(feats, dict):
                 ocr_txt = str(feats.get("ocr_text") or "").strip()
 
-        transcript_txt = ""
-        tr_entry = context.intermediate_outputs.get("transcript") or {}
-        if isinstance(tr_entry, dict) and tr_entry.get("status") == "success":
-            feats_t = tr_entry.get("features")
-            if isinstance(feats_t, dict):
-                transcript_txt = str(feats_t.get("transcript") or "").strip()
-
+        transcript_entry = context.intermediate_outputs.get("transcript") or {}
+        transcript_feats = transcript_entry.get("features") or {}
+        transcript = transcript_feats.get("transcript", "")
+        
         sections = [
             "[CAPTION]",
             caption,
@@ -101,53 +111,26 @@ class EmbeddingExtractor(BaseExtractor):
             "[OCR]",
             ocr_txt,
             "[TRANSCRIPT]",
-            transcript_txt,
+            transcript,
         ]
         text_bundle = "\n".join(sections).strip()
-
-        # --- Deterministic hash (always computed, even for empty bundles) ---
         bundle_hash = hashlib.sha256(text_bundle.encode("utf-8")).hexdigest()
 
-        # --- Pre-encoding cache: skip if hash + model version unchanged ---
-        existing_emb = context.intermediate_outputs.get("_prev_embedding") or {}
-        if isinstance(existing_emb, dict):
-            if (
-                existing_emb.get("text_bundle_hash") == bundle_hash
-                and existing_emb.get("model_name") == self._config.model_name
-                and existing_emb.get("model_version") == self._config.model_version
-                and existing_emb.get("embedding_version")
-                == self._config.embedding_version
-            ):
-                return ExtractorResult.skipped("embedding_unchanged")
-
-        # --- Lazy import ---
-        try:
-            from sentence_transformers import SentenceTransformer  # type: ignore
-        except Exception:  # noqa: BLE001
-            return ExtractorResult.skipped("sentence_transformers_not_available")
-
-        # --- Singleton model loading ---
-        global _MODEL_CACHE
-        if _MODEL_CACHE is None:
-            _MODEL_CACHE = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-
-        model = _MODEL_CACHE
-
-        # --- Encode ---
-        emb = await asyncio.to_thread(
-            model.encode, text_bundle, normalize_embeddings=False
+        logger.info(
+            "embedding_from_context dim=%d hash=%s version=%s",
+            len(context.text_embedding),
+            bundle_hash[:12],
+            context.inference_version,
+            extra={"reel_id": context.reel_id},
         )
-        embedding_list = [float(x) for x in emb.tolist()]
 
         return ExtractorResult.success(
             {
-                "embedding": embedding_list,
+                "embedding": context.text_embedding,
                 "embedding_model_name": self._config.model_name,
                 "embedding_model_version": self._config.model_version,
                 "embedding_version": self._config.embedding_version,
                 "text_bundle_hash": bundle_hash,
-                "model_name": "sentence-transformers/all-MiniLM-L6-v2",
-                "model_version": "v1",
-                "embedding_version": "v1",
             }
         )
+

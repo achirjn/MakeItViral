@@ -19,10 +19,10 @@ Scheduler (Polling)
 ---
 
 ## 1. The Scheduler (`module2/scheduler.py`)
-The scheduler is a **stateless DB polling loop** that transitions Reels from `pending` → `ready_for_processing`. It does NOT own any job state — it only writes a status column and exits.
+The scheduler is a **stateless DB polling loop** that transitions Reels from `PENDING` → `READY_FOR_PROCESSING`. It does NOT own any job state — it only writes a status column and exits.
 
 ### Eligibility Requirements:
-- `ingestion_status = 'pending'`
+- `ingestion_status = 'PENDING'`
 - `thumbnail_url IS NOT NULL`
 - `creator_id IS NOT NULL`
 
@@ -48,7 +48,7 @@ Before any database interaction, the worker validates that:
 This prevents accidental runs with no extractors from silently claiming and wasting reels.
 
 ### Job Claiming (`module2/job_fetcher.py`)
-- Queries for one reel with `ingestion_status = 'ready_for_processing'`.
+- Queries for one reel with `ingestion_status = 'READY_FOR_PROCESSING'`.
 - Same `FOR UPDATE SKIP LOCKED` prevents any two workers from claiming the same row.
 - Orders by the same priority score formula as the Scheduler.
 
@@ -67,15 +67,33 @@ These 4 extractors are expensive (Tesseract OCR, Whisper transcription, sentence
 ```
 1. Validate extractors (not None, not empty)
 2. claim_next_reel()          → row-locked reel object
-3. Build metadata dict        → includes account_id="default"
-4. ExtractionContext.create() → temp dir created
-5. Engagement filter          → strip heavy extractors if no views/likes
-6. execute_extractor_dag()    → all eligible extractors run
-7. compute_projections()      → heuristic + LLM fusion scoring
-8. persist_from_context()     → upsert features + projections + embeddings
-9. session.commit()           → release row lock
-10. [finally] cleanup_context() → delete temp dir, video, audio, frames
+3. Cooldown check             → skip if reel_id was skipped < 30s ago (in-memory cache)
+4. Completion gating          → query reel_projections; skip if projection_version == current
+5. Build metadata dict        → includes account_id="test_account"
+6. ExtractionContext.create() → temp dir created
+7. Engagement filter          → strip heavy extractors if no views/likes
+8. execute_extractor_dag()    → all eligible extractors run
+9. compute_projections()      → heuristic + LLM fusion scoring
+10. persist_from_context()    → upsert features + projections + embeddings
+11. session.commit()          → release row lock
+12. [finally] cleanup_context() → delete temp dir, video, audio, frames
 ```
+
+### Completion Gating (Projection-Version Based):
+After claiming a reel, the worker queries `reel_projections` for the claimed `reel_id`. If a row exists **and** its `projection_version` matches the current `PROJECTION_VERSION` constant (currently `"v1"`), the worker logs `already_processed_skip` and returns without running the DAG.
+
+This means:
+- Each reel is processed **exactly once** per projection version.
+- Bumping `PROJECTION_VERSION` in `engine.py` automatically triggers reprocessing of all reels.
+- No schema changes are needed — `projection_version` already exists in `reel_projections`.
+
+### Cooldown Skip Optimization:
+To prevent tight reclaim loops where the same reel is repeatedly claimed and immediately skipped, the worker maintains an **in-memory ephemeral cache** (`_recent_skip_cache`) of recently skipped reel IDs.
+
+- When a reel is skipped via completion gating, its `reel_id` is cached with the current monotonic timestamp.
+- On subsequent claims within `_SKIP_COOLDOWN_SECONDS` (30s), the worker returns immediately with a DEBUG `cooldown_skip` log.
+- The cache resets naturally on worker restart (no DB state).
+- After the cooldown window expires, the reel is rechecked normally.
 
 ### Failure Semantics:
 - Any critical extractor failure raises immediately → `session.rollback()` → `cleanup_context()`.
@@ -88,14 +106,19 @@ The `ExtractionContext` is a dataclass that lives for the duration of one worker
 
 | Field | Purpose |
 |---|---|
-| `reel_id` | UUID of the reel being processed |
+| `reel_id` | UUID of reel being processed |
 | `temp_dir` | OS temp directory (unique per job) |
-| `video_path` | Path to the downloaded `.mp4` file |
-| `audio_path` | Path to the extracted `.wav` file |
+| `video_path` | Path to downloaded `.mp4` file |
+| `audio_path` | Path to extracted `.wav` file |
 | `sampled_frames` | List of paths to extracted `.jpg` frame files |
-| `metadata` | Snapshot of the reel's Module 1 DB metadata (includes `account_id`) |
+| `metadata` | Snapshot of reel's Module 1 DB metadata (includes `account_id`) |
 | `intermediate_outputs` | All extractor results, keyed by extractor name |
 | `model_versions` | Version tags attached to each feature row |
+| `transcript` | Shared remote inference result: Whisper transcription |
+| `transcript_confidence` | Shared remote inference result: transcript confidence score |
+| `text_embedding` | Shared remote inference result: MiniLM 384-dim vector |
+| `clip_embedding` | Shared remote inference result: CLIP 768-dim vector |
+| `inference_version` | Shared remote inference result: version identifier |
 
 ### Cleanup (`module2/cleanup.py`):
 `cleanup_context()` is called inside the worker's `finally:` block unconditionally. It:
@@ -125,14 +148,17 @@ A custom `asyncio`-native DAG executor. No external libraries (Airflow, Celery, 
 ```
 video_fetcher (critical)
 ├── video_probe (critical)
+├── remote_inference (critical)
+│   ├── embedding (optional)
+│   ├── visual_embedding (optional)
+│   └── transcript (optional)
 ├── frame_sampler (critical)
 │   ├── motion (critical)
 │   │   └── hook (critical)
 │   │       └── llm_hook (optional)    ← Phase 14
 │   ├── ocr (optional)
 │   └── audio (critical)
-│       └── transcript (optional)
-└── embedding (optional, no deps)     ← runs independently
+│       └── transcript (optional)  ← now depends on remote_inference
 ```
 
 ---
@@ -178,6 +204,7 @@ Every extractor inherits from `BaseExtractor` and must implement:
 
 ### Phase 8 — Motion Extractor (`extractors/motion.py`)
 - Pipes all sampled frames back through `ffmpeg` into a `rawvideo` byte stream (scaled to 160px wide, grayscale).
+- Uses sequential pattern (`frame_%05d.jpg`) matching `frame_sampler`'s output naming — avoids `-pattern_type glob` which is unsupported on Windows ffmpeg builds.
 - Computes absolute pixel difference between consecutive frames entirely in pure Python (no OpenCV/NumPy).
 - Returns `motion_score` (mean normalized diff) and `scene_change_rate` (changes/second).
 - Validates `video_probe` intermediate output has `status == "success"` before reading features.
@@ -321,53 +348,48 @@ confidence = (required_present + 0.5 × optional_present) / (2 + 0.5 × 1)
 ```
 Required signals: `motion_score`, `scene_change_rate` (count=2). Optional: `hook_ocr_present` (count=1, validated with `isinstance(bool)`).
 
-Results are written to `context.intermediate_outputs["projections"]`.
+Results are written to `context.intermediate_outputs["projections"]` along with `projection_version` (currently `"v1"`).
+
+### Defensive Access Pattern:
+All extractor feature reads use the null-safe pattern:
+```python
+entry = context.intermediate_outputs.get("<extractor_name>")
+features = (entry or {}).get("features") or {}
+```
+This guarantees the projection engine **never crashes** when optional extractors are skipped, failed, or return `features: None`. If an optional extractor's output is missing, the engine falls back gracefully (e.g., heuristic-only hook score, zero coverage).
 
 ---
 
-## 9. Embedding Extractor (`module2/extractors/embedding.py`) — Phase 13
+## 9. Remote Inference Extractor (`module2/extractors/remote_inference_extractor.py`) — Phase 15
 
-The embedding extractor converts each reel's multimodal text signals into a dense 384-dimensional vector.
+The remote inference extractor centralizes all Colab GPU calls into a **single execution per reel**. It performs Whisper transcription, MiniLM text embedding, and CLIP visual embedding in one multipart upload, then stores results in `ExtractionContext` for downstream extractors to consume.
 
-### Text Bundle Construction:
-Concatenates 4 sections with labeled headers:
-```
-[CAPTION]       ← from context.metadata["caption"]
-[HASHTAGS]      ← from context.metadata["hashtags"], joined as #tag1 #tag2
-[OCR]           ← from ocr intermediate output (optional)
-[TRANSCRIPT]    ← from transcript intermediate output (optional)
-```
+### Dependencies
+- `dependencies = ["video_fetcher"]` — waits for local video download.
+- `is_critical = True` — failure aborts the pipeline.
+- `requires_gpu = True` — indicates remote GPU usage.
 
-### Deduplication Guard:
-A SHA-256 hash of the text bundle (`text_bundle_hash`) is **always** computed, even for empty bundles. This allows pre-encoding cache checks and prevents redundant model inference.
+### Execution Flow
+1. Validates `context.video_path` exists.
+2. Calls `call_remote_inference(context, context.video_path)` with multipart upload.
+3. Stores results in `ExtractionContext` fields:
+   - `context.transcript`
+   - `context.text_embedding`
+   - `context.clip_embedding`
+   - `context.inference_version`
+4. Returns `ExtractorResult.success` with all four keys.
 
-### Pre-Encoding Cache:
-Before calling the model, the extractor checks `context.intermediate_outputs["_prev_embedding"]` for a match on `text_bundle_hash` + `model_name` + `model_version` + `embedding_version`. If all 4 match → returns `skipped("embedding_unchanged")` without loading the model.
+### Output Keys
+- `transcript`
+- `text_embedding`
+- `clip_embedding`
+- `inference_version`
 
-### Model Loading:
-- **Lazy import:** `from sentence_transformers import SentenceTransformer` is imported inside `run()`. If not installed → `skipped("sentence_transformers_not_available")`.
-- **Module-level singleton:** A `_MODEL_CACHE` variable holds the loaded model. First call creates it; subsequent calls reuse it. Prevents repeated 200MB+ model loads.
-
-### Model Configuration:
-| Parameter | Value |
-|---|---|
-| Model | `sentence-transformers/all-MiniLM-L6-v2` |
-| Dimensions | 384 |
-| Device | CPU |
-| Normalization | Disabled (raw vector) |
-
-### DAG Properties:
-- `dependencies = []` — runs independently, reads whatever signals are available.
-- `is_critical = False` — pipeline continues without embeddings if dependencies missing.
-- Part of `heavy_extractors` set → skipped for reels without engagement data.
-
-### Persistence:
-Embeddings are upserted into `reel_embeddings` with a **conditional `WHERE` guard**: the embedding is only overwritten if `model_name`, `model_version`, or `embedding_version` has changed. Persistence requires **all 5 fields** (`embedding`, `model_name`, `model_version`, `embedding_version`, `text_bundle_hash`) to be non-None — if any is missing, the embedding upsert is silently skipped.
+### Logging
+- `remote_inference_started` with `reel_id`
+- `remote_inference_completed` with `reel_id`, `text_dim`, `clip_dim`
 
 ---
-
-## 10. Central Persistence (`module2/persistence.py`)
-
 `persist_from_context()` is the **only** place DB writes happen in Module 2.
 
 ### Algorithm:
@@ -443,10 +465,12 @@ The `ExtractorRegistry` is the single loader that maps extractor classes to the 
 | 4 | `MotionExtractor` | 8 |
 | 5 | `OcrExtractor` | 9 |
 | 6 | `AudioExtractor` | 10 |
-| 7 | `TranscriptExtractor` | 10 |
-| 8 | `HookExtractor` | 11 |
-| 9 | `LlmHookExtractor` | 14 |
-| 10 | `EmbeddingExtractor` | 13 |
+| 7 | `RemoteInferenceExtractor` | 15 |
+| 8 | `TranscriptExtractor` | 10 |
+| 9 | `HookExtractor` | 11 |
+| 10 | `LlmHookExtractor` | 14 |
+| 11 | `EmbeddingExtractor` | 13 |
+| 12 | `VisualEmbeddingExtractor` | 13 |
 
 ---
 
@@ -622,10 +646,115 @@ List of dicts: `{ similarity: float, views: int, likes: int, comments: int }`
 
 ---
 
-## 17. Outstanding Items
+## 17. Feature Gating & Activation Planner (`module2/planner.py`)
+
+The pipeline uses **demand-driven DAG execution**: heavy extractors only run when their outputs are needed by the projection engine.
+
+### Extractor Metadata
+
+`BaseExtractor` provides 4 non-abstract metadata properties (safe defaults for backward compatibility):
+
+| Property | Type | Default | Purpose |
+|---|---|---|---|
+| `produces` | `set[str]` | `set()` | Logical feature names this extractor produces |
+| `requires` | `set[str]` | `set()` | Features required before this extractor can run |
+| `optional_requires` | `set[str]` | `set()` | Features used if available, not required |
+| `heavy` | `bool` | `False` | True for expensive extractors (ML, API calls) |
+
+### Extractor Feature Graph
+
+| Extractor | `produces` | `requires` | `optional_requires` | `heavy` |
+|---|---|---|---|---|
+| `video_fetcher` | `video` | — | — | ✗ |
+| `video_probe` | `probe` | `video` | — | ✗ |
+| `frame_sampler` | `frames` | `probe` | — | ✗ |
+| `motion` | `motion` | `frames` | — | ✗ |
+| `hook` | `hook_score` | `motion` | `ocr` | ✗ |
+| `audio` | `audio` | `frames` | — | ✗ |
+| `ocr` | `ocr` | `frames` | — | ✓ |
+| `remote_inference` | `inference` | `video` | — | ✓ |
+| `transcript` | `transcript` | `inference` | — | ✓ |
+| `llm_hook` | `llm_hook_score`, `llm_hook_confidence` | `hook_score` | `ocr`, `transcript` | ✓ |
+| `embedding` | `embedding` | `inference` | `ocr`, `transcript` | ✓ |
+| `visual_embedding` | `clip_embedding` | `inference` | — | ✓ |
+
+### Projection Demand Constants (`engine.py`)
+
+```python
+REQUIRED_PROJECTION_FEATURES = {"hook_score", "motion"}
+OPTIONAL_PROJECTION_FEATURES = {"llm_hook_score", "llm_hook_confidence", "embedding"}
+```
+
+### Two-Phase Execution
+
+**Phase A — Baseline:** Backward-propagates `REQUIRED_PROJECTION_FEATURES` + `_BASELINE_EXTRAS` through extractor graph → activates `video_fetcher → video_probe → frame_sampler → motion → hook` + `remote_inference` (always runs due to baseline extras).
+
+**Phase B — Adaptive:** After baseline executes, heuristic signals determine which heavy extractors to activate:
+
+| Heuristic Signal | Demanded Features | Activated Extractors |
+|---|---|---|
+| Hook score in gray zone [0.25, 0.75] | `llm_hook_score`, `llm_hook_confidence` | `llm_hook` |
+| Reel has engagement metrics (views + likes) | `embedding` | `embedding` |
+
+Phase B extractors are backward-propagated and topologically sorted. Only extractors not already in baseline are executed.
+
+### Planner API
+
+```python
+plan_baseline_extractors(extractors) -> list     # Phase A
+plan_adaptive_extractors(extractors, context) -> list  # Phase B (minus baseline)
+topo_sort_extractors(extractors) -> list         # Kahn's algorithm
+```
+
+### Worker Integration
+
+```
+baseline = plan_baseline_extractors(extractors)
+await execute_extractor_dag(context, baseline)
+
+adaptive = plan_adaptive_extractors(extractors, context)
+if adaptive:
+    await execute_extractor_dag(context, adaptive)
+```
+
+Replaces the legacy `heavy_extractors` engagement filter.
+
+---
+
+## 18. Dataset Hardening (15K Run Safety)
+
+Safety and integrity guarantees for large-scale dataset collection.
+
+### Schema Additions
+- `feature_coverage JSONB NOT NULL DEFAULT '{}'` — records per-extractor success/fail/skip.
+- `extractor_failures JSONB NOT NULL DEFAULT '{}'` — records error messages for failed extractors.
+- Migration: `db/migrations/003_dataset_hardening.sql` (must run before worker start).
+
+### Runtime Guards
+- **240s hard timeout** per reel (`asyncio.wait_for`). On timeout: rollback, cleanup, no partial persistence.
+- **500MB video size limit**. After download: check file size, skip if exceeded.
+
+### Projection Version Freeze
+- `_LOCKED_PROJECTION_VERSION` captured at module load.
+- Every `run_once` asserts no mid-run mutation. Mismatch → `RuntimeError` (fail fast).
+- Startup log: `projection_version_locked: v1`
+
+### Periodic Metrics
+Every 100 reels, structured `worker_metrics` log with: `total_processed`, `total_failed`, `total_skipped`, `total_timeouts`, `avg_runtime_s`, `heavy_activation_rate`, `failure_rate`.
+
+### Startup Self-Test
+`verify_dataset_schema()` executes `SELECT feature_coverage, extractor_failures FROM reel_projections LIMIT 1`. Missing columns → `RuntimeError` with migration instructions.
+
+### Safe Re-run
+- Same `projection_version` → `already_processed_skip` (existing behavior).
+- Different `projection_version` → `reprocess_detected` log, full reprocessing.
+- Coverage and failures fully overwritten on re-run (no COALESCE).
+
+---
+
+## 19. Outstanding Items
 - **`IngestionStatus` enum**: Missing `PROCESSING` and `COMPLETED` values — currently log-only.
 - **`ingestion_service.py`**: Still uses legacy SQLAlchemy 1.x `session.query()` API.
-- **`requirements.txt`**: Missing `sentence-transformers`, `pgvector`, and `openai`.
 - **`OPENAI_API_KEY`**: Required environment variable for Phase 14 LLM hook — not yet documented in `.env`.
 - **`LOG_LEVEL`**: Optional environment variable (default `INFO`) — set to `DEBUG` for extractor tracing.
 - **`scheduler.py`**: Still uses raw `logging.getLogger(__name__)` — not yet migrated to `get_logger`.

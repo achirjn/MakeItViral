@@ -50,9 +50,11 @@ def build_default_registry() -> ExtractorRegistry:
     from module2.extractors.llm_hook import LlmHookExtractor
     from module2.extractors.motion import MotionExtractor
     from module2.extractors.ocr import OcrExtractor
+    from module2.extractors.remote_inference_extractor import RemoteInferenceExtractor
     from module2.extractors.transcript import TranscriptExtractor
     from module2.extractors.video_fetcher import VideoFetcherExtractor
     from module2.extractors.video_probe import VideoProbeExtractor
+    from module2.extractors.visual_embedding import VisualEmbeddingExtractor
 
     reg = ExtractorRegistry()
     reg.register_many(
@@ -66,7 +68,9 @@ def build_default_registry() -> ExtractorRegistry:
             TranscriptExtractor,
             HookExtractor,
             LlmHookExtractor,
+            RemoteInferenceExtractor,
             EmbeddingExtractor,
+            VisualEmbeddingExtractor,
         ]
     )
     return reg

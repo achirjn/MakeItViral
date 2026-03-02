@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -98,6 +99,10 @@ class VideoFetcherExtractor(BaseExtractor):
     def requires_gpu(self) -> bool:
         return False
 
+    @property
+    def produces(self) -> set[str]:
+        return {"video"}
+
     async def run(self, context: ExtractionContext) -> ExtractorResult:
         reel_url = (context.metadata.get("reel_url") or "").strip()
         if not reel_url:
@@ -116,24 +121,28 @@ class VideoFetcherExtractor(BaseExtractor):
         cookies_path = tmp_dir / f"cookies_{account_id}.txt"
         _write_netscape_cookies(storage_state, cookies_path)
 
-        out_path = tmp_dir / f"{context.reel_id}.mp4"
+        out_template = tmp_dir / f"{context.reel_id}_%(playlist_index)s.%(ext)s"
 
         start = time.time()
-        logger.debug(
-            "yt_dlp_invoked",
+
+        logger.info(
+            "video_download_started",
             extra={"reel_id": context.reel_id},
         )
         try:
             ydl_opts: Dict[str, Any] = {
-                "cookiefile": str(cookies_path),
-                "outtmpl": str(out_path),
-                "format": "mp4/best",
-                "noplaylist": True,
+                "outtmpl": str(out_template),
+                "format": "bv*+ba/b",
+                "merge_output_format": "mp4",
                 "quiet": True,
                 "no_warnings": True,
             }
-            with YoutubeDL(ydl_opts) as ydl:
-                ydl.download([reel_url])
+
+            def _download() -> None:
+                with YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([reel_url])
+
+            await asyncio.to_thread(_download)
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "yt_dlp_failure error=%s",
@@ -142,11 +151,21 @@ class VideoFetcherExtractor(BaseExtractor):
             )
             return ExtractorResult.failed(f"download_failed:{exc}")
 
-        if not out_path.exists():
+        downloaded_files = list(tmp_dir.glob(f"{context.reel_id}_*.mp4"))
+
+        if not downloaded_files:
             return ExtractorResult.failed("download_failed:missing_output_file")
 
-        context.video_path = str(out_path)
+        # Take first video if multiple (carousel case)
+        context.video_path = str(downloaded_files[0])
         elapsed = time.time() - start
+
+        logger.info(
+            "video_download_finished elapsed_s=%.3f path=%s",
+            elapsed,
+            context.video_path,
+            extra={"reel_id": context.reel_id},
+        )
 
         return ExtractorResult.success(
             {

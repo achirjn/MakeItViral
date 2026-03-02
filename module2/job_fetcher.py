@@ -30,3 +30,22 @@ def claim_next_reel(session: Session) -> Optional[Reel]:
     )
     return session.execute(stmt).scalars().one_or_none()
 
+
+def peek_next_reel_id(session: Session) -> Optional[str]:
+    """
+    Lockless peek: returns the reel_id of the next eligible reel
+    WITHOUT acquiring a row lock. Used for pre-claim cooldown checks.
+    """
+    likes = func.coalesce(Reel.likes, 0)
+    comments = func.coalesce(Reel.comments, 0)
+    views = func.coalesce(Reel.views, 0)
+    priority = likes + comments + (views * 0.001)
+
+    stmt = (
+        select(Reel.id)
+        .where(Reel.ingestion_status == IngestionStatus.READY_FOR_PROCESSING.value)
+        .order_by(desc(priority), desc(Reel.publish_time).nullslast())
+        .limit(1)
+    )
+    result = session.execute(stmt).scalar_one_or_none()
+    return str(result) if result is not None else None

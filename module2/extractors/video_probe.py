@@ -70,7 +70,16 @@ class VideoProbeExtractor(BaseExtractor):
 
     @property
     def output_keys(self) -> List[str]:
-        return ["duration", "fps", "resolution", "width", "height"]
+        return [
+            "duration",
+            "fps",
+            "resolution",
+            "width",
+            "height",
+            "has_audio",
+            "audio_codec",
+            "audio_channels",
+        ]
 
     @property
     def is_critical(self) -> bool:
@@ -79,6 +88,14 @@ class VideoProbeExtractor(BaseExtractor):
     @property
     def requires_gpu(self) -> bool:
         return False
+
+    @property
+    def produces(self) -> set[str]:
+        return {"probe"}
+
+    @property
+    def requires(self) -> set[str]:
+        return {"video"}
 
     async def run(self, context: ExtractionContext) -> ExtractorResult:
         if not context.video_path:
@@ -115,9 +132,15 @@ class VideoProbeExtractor(BaseExtractor):
         fmt = payload.get("format") or {}
 
         video_stream = None
+        audio_stream = None
         for s in streams:
             if isinstance(s, dict) and s.get("codec_type") == "video":
                 video_stream = s
+                break
+
+        for s in streams:
+            if isinstance(s, dict) and s.get("codec_type") == "audio":
+                audio_stream = s
                 break
 
         if not isinstance(video_stream, dict):
@@ -125,6 +148,18 @@ class VideoProbeExtractor(BaseExtractor):
 
         width = video_stream.get("width")
         height = video_stream.get("height")
+
+        has_audio = isinstance(audio_stream, dict)
+        audio_codec = audio_stream.get("codec_name") if has_audio else None
+        audio_channels = audio_stream.get("channels") if has_audio else None
+
+        logger.info(
+            "probe_audio has_audio=%s codec=%s channels=%s",
+            has_audio,
+            audio_codec,
+            audio_channels,
+            extra={"reel_id": context.reel_id},
+        )
 
         fps = _parse_fraction(
             video_stream.get("avg_frame_rate") or ""
@@ -153,5 +188,8 @@ class VideoProbeExtractor(BaseExtractor):
                 "resolution": resolution,
                 "width": int(width),
                 "height": int(height),
+                "has_audio": has_audio,
+                "audio_codec": audio_codec,
+                "audio_channels": audio_channels,
             }
         )

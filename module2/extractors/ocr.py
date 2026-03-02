@@ -67,6 +67,18 @@ class OcrExtractor(BaseExtractor):
     def requires_gpu(self) -> bool:
         return False
 
+    @property
+    def produces(self) -> set[str]:
+        return {"ocr"}
+
+    @property
+    def requires(self) -> set[str]:
+        return {"frames"}
+
+    @property
+    def heavy(self) -> bool:
+        return True
+
     async def run(self, context: ExtractionContext) -> ExtractorResult:
         if not context.sampled_frames:
             return ExtractorResult.skipped("no_sampled_frames")
